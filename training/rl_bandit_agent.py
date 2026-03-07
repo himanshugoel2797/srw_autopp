@@ -52,17 +52,16 @@ from training.adaptive_bpm import compute_reference_adaptive
 # ============================================================================
 
 N_AUX = 12       # analytical prior scalars
-N_MODES = 6      # AnalTreatment {0, 1, 2, 3, 4, 5}
+N_MODES = 5      # AnalTreatment {0, 1, 2, 3, 4}
 N_RESIZE = 4     # (pxm, pxd, pzm, pzd)
 EMBED_DIM = 256  # embedding dimension (256 with PyTorch autograd)
 
 MODE_NAMES = {
     0: "Standard angular",
     1: "Quad-phase (moment)",
-    2: "Quad-phase (err-bar)",
+    2: "Quad-phase (special)",
     3: "From waist",
     4: "To waist",
-    5: "To waist (non-paraxial)",
 }
 
 

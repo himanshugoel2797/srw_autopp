@@ -10,3 +10,4 @@ reference_cache/
 *.onnx
 .venv/
 venv/
+runs/**
