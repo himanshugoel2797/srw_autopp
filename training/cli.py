@@ -1,9 +1,10 @@
 """
-Command-line interface for dataset generation and model training.
+Command-line interface for dataset generation, CNN pretraining, and RL training.
 
 Usage:
     python -m training.cli generate-dataset --output-dir data/train --n-samples 500
-    python -m training.cli train --dataset data/train --n-episodes 1000
+    python -m training.cli pretrain --dataset data/train --save pretrained.pt
+    python -m training.cli train --dataset data/train --pretrained pretrained.pt -n 1000
     python -m training.cli train --n-episodes 200  # on-the-fly generation
 """
 
@@ -33,6 +34,44 @@ def cmd_generate_dataset(args):
     print(f"\nDataset saved to {out}")
 
 
+def cmd_pretrain(args):
+    import torch
+    from training.rl_bandit_agent import (
+        BanditAgent, CNNPretrainer, PrecomputedDataset,
+    )
+
+    agent = BanditAgent(D=args.embed_dim, n_transformer_blocks=args.n_blocks)
+
+    n_cnn_params = sum(p.numel() for p in agent.patch_cnn.parameters())
+    n_total = sum(p.numel() for p in agent.parameters())
+    print(f"Agent: D={args.embed_dim}, {args.n_blocks} blocks, "
+          f"{n_total:,} total params, {n_cnn_params:,} CNN params")
+
+    dataset = None
+    if args.dataset:
+        dataset = PrecomputedDataset(args.dataset)
+        print(f"Dataset: {len(dataset)} samples from {args.dataset}")
+
+    pretrainer = CNNPretrainer(
+        agent, lr=args.lr, log_dir=args.log_dir,
+    )
+    pretrainer.train(
+        n_epochs=args.n_epochs,
+        samples_per_epoch=args.samples_per_epoch,
+        verbose=not args.quiet,
+        dataset=dataset,
+    )
+
+    if args.save:
+        os.makedirs(os.path.dirname(args.save) or '.', exist_ok=True)
+        torch.save({
+            'agent_state_dict': agent.state_dict(),
+            'pretrain_history': pretrainer.history,
+            'args': vars(args),
+        }, args.save)
+        print(f"Pretrained checkpoint saved to {args.save}")
+
+
 def cmd_train(args):
     import torch
     from training.rl_bandit_agent import (
@@ -47,6 +86,20 @@ def cmd_train(args):
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         agent.load_state_dict(checkpoint['agent_state_dict'])
         print(f"Resumed from checkpoint: {args.resume}")
+    elif args.pretrained:
+        checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
+        # Load only matching keys (the CNN weights) from the pretrained checkpoint
+        pretrained_state = checkpoint['agent_state_dict']
+        agent_state = agent.state_dict()
+        loaded_keys = []
+        for k, v in pretrained_state.items():
+            if k in agent_state and agent_state[k].shape == v.shape:
+                agent_state[k] = v
+                loaded_keys.append(k)
+        agent.load_state_dict(agent_state)
+        cnn_keys = [k for k in loaded_keys if k.startswith('patch_cnn.')]
+        print(f"Loaded pretrained weights: {len(loaded_keys)} keys "
+              f"({len(cnn_keys)} CNN params)")
 
     n_params = sum(p.numel() for p in agent.parameters())
     print(f"Agent: D={args.embed_dim}, {args.n_blocks} blocks, {n_params:,} params")
@@ -98,7 +151,7 @@ def cmd_train(args):
 def main():
     parser = argparse.ArgumentParser(
         prog='srw-train',
-        description='SRW Parameter Advisor: dataset generation and training',
+        description='SRW Parameter Advisor: dataset generation, pretraining, and training',
     )
     sub = parser.add_subparsers(dest='command', required=True)
 
@@ -114,6 +167,28 @@ def main():
                      help='Random seed (default: 42)')
     gen.add_argument('--quiet', '-q', action='store_true',
                      help='Suppress progress output')
+
+    # --- pretrain ---
+    pt = sub.add_parser('pretrain',
+                        help='Pretrain CNN encoder on patch feature prediction')
+    pt.add_argument('--dataset', '-d',
+                    help='Path to precomputed dataset directory')
+    pt.add_argument('--n-epochs', '-n', type=int, default=50,
+                    help='Number of pretraining epochs (default: 50)')
+    pt.add_argument('--samples-per-epoch', type=int, default=64,
+                    help='Wavefronts per epoch (default: 64)')
+    pt.add_argument('--lr', type=float, default=1e-3,
+                    help='Learning rate (default: 1e-3)')
+    pt.add_argument('--embed-dim', type=int, default=256,
+                    help='Agent embedding dimension (default: 256)')
+    pt.add_argument('--n-blocks', type=int, default=2,
+                    help='Number of transformer blocks (default: 2)')
+    pt.add_argument('--save', '-s',
+                    help='Path to save pretrained checkpoint (.pt)')
+    pt.add_argument('--log-dir',
+                    help='TensorBoard log directory')
+    pt.add_argument('--quiet', '-q', action='store_true',
+                    help='Suppress progress output')
 
     # --- train ---
     tr = sub.add_parser('train', help='Train the bandit agent')
@@ -137,6 +212,8 @@ def main():
                     help='Path to save model checkpoint (.pt)')
     tr.add_argument('--resume', '-r',
                     help='Path to checkpoint to resume from (.pt)')
+    tr.add_argument('--pretrained',
+                    help='Path to pretrained CNN checkpoint (.pt) for weight init')
     tr.add_argument('--history',
                     help='Path to save training history (.json)')
     tr.add_argument('--log-dir',
@@ -150,6 +227,8 @@ def main():
 
     if args.command == 'generate-dataset':
         cmd_generate_dataset(args)
+    elif args.command == 'pretrain':
+        cmd_pretrain(args)
     elif args.command == 'train':
         cmd_train(args)
 
