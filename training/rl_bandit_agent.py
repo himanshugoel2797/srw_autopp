@@ -35,7 +35,6 @@ from torch.utils.tensorboard import SummaryWriter
 from srw_param_advisor.wavefront import WavefrontSnapshot
 from srw_param_advisor.validator import (
     generate_test_wavefront,
-    simulate_drift_propagation,
     _estimate_beam_sigma,
 )
 from srw_param_advisor.preprocessing import (
@@ -427,6 +426,64 @@ def apply_resize(wfr, pxm, pzm, pxd, pzd):
         Robs_x=wfr.Robs_x, Robs_z=wfr.Robs_z)
 
 
+def srw_propagate(wfr: WavefrontSnapshot, drift_length: float,
+                   params: dict) -> WavefrontSnapshot:
+    """
+    Propagate a wavefront through a drift using SRW with the given parameters.
+
+    Parameters
+    ----------
+    wfr : WavefrontSnapshot
+        Input wavefront.
+    drift_length : float
+        Drift length in metres.
+    params : dict
+        Must contain 'analyt_treat', 'pxm', 'pxd', 'pzm', 'pzd'.
+        analyt_treat: 0 = no semi-analytical treatment, 1 = allow quadratic
+                      phase removal (standard for most cases).
+        pxm/pzm: horizontal/vertical range magnification factors.
+        pxd/pzd: horizontal/vertical resolution change factors.
+
+    Returns
+    -------
+    WavefrontSnapshot
+        Propagated wavefront.
+    """
+    from srwpy.srwlib import srwl, SRWLOptD, SRWLOptC
+
+    srw_wfr = wfr.to_srw()
+
+    # SRW propagation parameter list (12 elements):
+    #  [0]: Auto-Resize before (1=yes, 0=no)
+    #  [1]: Auto-Resize after (1=yes, 0=no)
+    #  [2]: Relative precision for auto-resizing (1.0 = nominal)
+    #  [3]: Allow semi-analytical quadratic phase treatment (1=yes, 0=no)
+    #  [4]: Resize on Fourier side using FFT (1=yes, 0=no)
+    #  [5]: Horizontal range modification factor (multiplier)
+    #  [6]: Horizontal resolution modification factor (multiplier)
+    #  [7]: Vertical range modification factor (multiplier)
+    #  [8]: Vertical resolution modification factor (multiplier)
+    #  [9]: Wavefront shift type before resizing
+    # [10]: New horizontal center after shift
+    # [11]: New vertical center after shift
+    pp = [0] * 12
+    pp[0] = 0                         # no auto-resize before
+    pp[1] = 0                         # no auto-resize after
+    pp[2] = 1.0                       # precision (unused without auto-resize)
+    pp[3] = params['analyt_treat']    # semi-analytical quadratic phase
+    pp[4] = 0                         # resize in real space, not Fourier
+    pp[5] = params['pxm']             # horizontal range factor
+    pp[6] = params['pxd']             # horizontal resolution factor
+    pp[7] = params['pzm']             # vertical range factor
+    pp[8] = params['pzd']             # vertical resolution factor
+
+    drift = SRWLOptD(drift_length)
+    optBL = SRWLOptC([drift], [pp])
+    srwl.PropagElecField(srw_wfr, optBL)
+
+    return WavefrontSnapshot.from_srw(srw_wfr)
+
+
 def complex_correlation(E1, E2):
     """
     |⟨E1|E2⟩|² / (⟨E1|E1⟩·⟨E2|E2⟩)
@@ -797,13 +854,14 @@ class BanditTrainer:
     """
 
     def __init__(self, agent: BanditAgent, lambda_cost=0.1, lr=3e-4,
-                 entropy_coeff=0.01, log_dir=None):
+                 entropy_coeff=0.01, log_dir=None, propagate_fn=None):
         self.agent = agent
         self.lambda_cost = lambda_cost
         self.entropy_coeff = entropy_coeff
         self.optimizer = torch.optim.Adam(agent.parameters(), lr=lr)
         self.history = []
         self.writer = SummaryWriter(log_dir=log_dir)
+        self.propagate_fn = propagate_fn or srw_propagate
 
     def train(self, n_episodes=200, batch_size=8, verbose=True,
               dataset: 'PrecomputedDataset | None' = None):
@@ -876,15 +934,10 @@ class BanditTrainer:
 
                 params = action_to_params(mode, resize_deltas, prior)
 
-                # Evaluate proposed parameters
+                # Evaluate proposed parameters via propagation
                 try:
-                    wfr_r = apply_resize(wfr, params['pxm'], params['pzm'],
-                                         params['pxd'], params['pzd'])
-                    if wfr_r.nx * wfr_r.nz > 4096 * 4096:
-                        acc = 0.0
-                    else:
-                        result = simulate_drift_propagation(wfr_r, L)
-                        acc = compute_accuracy(result, ref)
+                    result = self.propagate_fn(wfr, L, params)
+                    acc = compute_accuracy(result, ref)
                 except Exception:
                     acc = 0.0
 
@@ -967,11 +1020,16 @@ class PredictionResult:
     corrections: dict
 
     def to_srw_prop_params(self) -> list:
-        p = [0] * 17
-        p[0] = 1; p[1] = 1; p[2] = 1.0
-        p[3] = self.analyt_treat
-        p[11] = self.pxm; p[12] = self.pxd
-        p[13] = self.pzm; p[14] = self.pzd
+        """Build SRW propagation parameter list (12 elements)."""
+        p = [0] * 12
+        p[0] = 0              # no auto-resize before
+        p[1] = 0              # no auto-resize after
+        p[2] = 1.0            # precision
+        p[3] = self.analyt_treat  # semi-analytical quadratic phase
+        p[5] = self.pxm       # horizontal range factor
+        p[6] = self.pxd       # horizontal resolution factor
+        p[7] = self.pzm       # vertical range factor
+        p[8] = self.pzd       # vertical resolution factor
         return p
 
     def __str__(self):
@@ -1045,21 +1103,24 @@ def evaluate(agent, n_test=30, verbose=True, writer=None, global_step=None):
 
         # Agent prediction
         pred = predict(agent, wfr, L)
+        pred_params = {'analyt_treat': pred.analyt_treat,
+                       'pxm': pred.pxm, 'pxd': pred.pxd,
+                       'pzm': pred.pzm, 'pzd': pred.pzd}
         try:
-            wfr_a = apply_resize(wfr, pred.pxm, pred.pzm, pred.pxd, pred.pzd)
-            res_a = simulate_drift_propagation(wfr_a, L)
+            res_a = srw_propagate(wfr, L, pred_params)
             acc_a = compute_accuracy(res_a, ref)
         except Exception:
             acc_a = 0.0
-        cost_a = compute_cost({'pxm': pred.pxm, 'pxd': pred.pxd,
-                               'pzm': pred.pzm, 'pzd': pred.pzd})
+        cost_a = compute_cost(pred_params)
 
         # Baseline: analytical params, no correction
         prior = prepare_analytical_prior(wfr, L)
         ap = get_analytical_params(prior)
+        base_params = {'analyt_treat': ap['AT'],
+                       'pxm': ap['pxm'], 'pxd': ap['pxd'],
+                       'pzm': ap['pzm'], 'pzd': ap['pzd']}
         try:
-            wfr_b = apply_resize(wfr, ap['pxm'], ap['pzm'], ap['pxd'], ap['pzd'])
-            res_b = simulate_drift_propagation(wfr_b, L)
+            res_b = srw_propagate(wfr, L, base_params)
             acc_b = compute_accuracy(res_b, ref)
         except Exception:
             acc_b = 0.0

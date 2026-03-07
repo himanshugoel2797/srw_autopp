@@ -23,6 +23,14 @@ from training.rl_bandit_agent import (
     _save_wavefront, _load_wavefront,
 )
 from training.adaptive_bpm import compute_reference_adaptive
+from srw_param_advisor.validator import simulate_drift_propagation, generate_test_wavefront
+
+
+def _fallback_propagate(wfr, drift_length, params):
+    """Test-only propagator that uses simple angular spectrum (no SRW needed)."""
+    wfr_r = apply_resize(wfr, params['pxm'], params['pzm'],
+                          params['pxd'], params['pzd'])
+    return simulate_drift_propagation(wfr_r, drift_length)
 
 
 # ============================================================================
@@ -459,7 +467,8 @@ def test_compute_reference_adaptive_negative_drift():
 def test_trainer_runs_without_error():
     """Smoke test: a few training episodes complete without exception."""
     agent = _make_agent()
-    trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3, entropy_coeff=0.01)
+    trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3, entropy_coeff=0.01,
+                            propagate_fn=_fallback_propagate)
     trainer.train(n_episodes=4, batch_size=2, verbose=False)
     assert len(trainer.history) > 0, "No training history recorded"
     print(f"✓ BanditTrainer: ran {len(trainer.history)} update steps")
@@ -467,7 +476,8 @@ def test_trainer_runs_without_error():
 
 def test_trainer_history_fields():
     agent = _make_agent()
-    trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3)
+    trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3,
+                            propagate_fn=_fallback_propagate)
     trainer.train(n_episodes=4, batch_size=2, verbose=False)
     for entry in trainer.history:
         assert 'episode' in entry
@@ -483,7 +493,8 @@ def test_trainer_parameters_change():
     """Parameters should change after training (vs. initial state)."""
     agent = _make_agent()
     params_before = {k: v.clone().detach() for k, v in agent.named_parameters()}
-    trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3)
+    trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3,
+                            propagate_fn=_fallback_propagate)
     trainer.train(n_episodes=4, batch_size=2, verbose=False)
     any_changed = any(
         not torch.equal(params_before[k], v.detach())
@@ -589,7 +600,8 @@ def test_trainer_with_precomputed_dataset():
         dataset = PrecomputedDataset(tmpdir)
 
         agent = _make_agent()
-        trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3, entropy_coeff=0.01)
+        trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3, entropy_coeff=0.01,
+                                propagate_fn=_fallback_propagate)
         trainer.train(n_episodes=4, batch_size=2, verbose=False, dataset=dataset)
         assert len(trainer.history) > 0
     print(f"✓ BanditTrainer with precomputed dataset: {len(trainer.history)} steps")
@@ -603,11 +615,138 @@ def test_trainer_precomputed_wraps_around():
         dataset = PrecomputedDataset(tmpdir)
 
         agent = _make_agent()
-        trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3, entropy_coeff=0.01)
+        trainer = BanditTrainer(agent, lambda_cost=0.1, lr=1e-3, entropy_coeff=0.01,
+                                propagate_fn=_fallback_propagate)
         # 6 episodes > 2 samples, must wrap
         trainer.train(n_episodes=6, batch_size=2, verbose=False, dataset=dataset)
         assert len(trainer.history) > 0
     print(f"✓ BanditTrainer with precomputed dataset: wraps around correctly")
+
+
+# ============================================================================
+# SRW cross-validation tests
+# ============================================================================
+
+from training.rl_bandit_agent import srw_propagate
+
+try:
+    from srwpy.srwlib import srwl
+    HAS_SRW = True
+except ImportError:
+    HAS_SRW = False
+
+
+def test_to_srw_roundtrip():
+    """WavefrontSnapshot → SRWLWfr → WavefrontSnapshot preserves fields."""
+    if not HAS_SRW:
+        print("⊘ to_srw roundtrip: skipped (srwpy not installed)")
+        return
+    wfr = _make_wavefront(nx=64, nz=32)
+    srw_wfr = wfr.to_srw()
+    back = WavefrontSnapshot.from_srw(srw_wfr)
+
+    assert back.nx == wfr.nx
+    assert back.nz == wfr.nz
+    assert np.allclose(back.Ex, wfr.Ex, atol=1e-6)
+    assert np.allclose(back.Ez, wfr.Ez, atol=1e-6)
+    assert abs(back.x_start - wfr.x_start) < 1e-10
+    assert abs(back.x_step - wfr.x_step) < 1e-10
+    assert abs(back.z_start - wfr.z_start) < 1e-10
+    assert abs(back.z_step - wfr.z_step) < 1e-10
+    assert abs(back.photon_energy_eV - wfr.photon_energy_eV) < 1e-6
+    print("✓ to_srw roundtrip: WavefrontSnapshot → SRWLWfr → WavefrontSnapshot")
+
+
+def test_srw_propagate_runs():
+    """srw_propagate produces a valid WavefrontSnapshot."""
+    if not HAS_SRW:
+        print("⊘ srw_propagate runs: skipped (srwpy not installed)")
+        return
+    wfr = _make_wavefront(nx=128, nz=128)
+    params = {'analyt_treat': 1, 'pxm': 1.0, 'pxd': 1.0,
+              'pzm': 1.0, 'pzd': 1.0}
+    result = srw_propagate(wfr, drift_length=1.0, params=params)
+    assert isinstance(result, WavefrontSnapshot)
+    assert result.nx > 0 and result.nz > 0
+    assert np.all(np.isfinite(result.Ex))
+    print(f"✓ srw_propagate runs: {result.nx}×{result.nz} output")
+
+
+def test_srw_vs_angular_spectrum_simple_beam():
+    """SRW and angular spectrum should agree for a well-resolved Gaussian beam."""
+    if not HAS_SRW:
+        print("⊘ SRW vs angular spectrum: skipped (srwpy not installed)")
+        return
+    from srw_param_advisor.validator import simulate_drift_propagation
+
+    # Well-resolved Gaussian beam: large R, moderate sigma, plenty of grid room
+    wfr = generate_test_wavefront(
+        nx=256, nz=256, dx=2e-6, dz=2e-6,
+        photon_energy_eV=12000, R_x=50.0, R_z=50.0,
+        beam_sigma_x=60e-6, beam_sigma_z=60e-6,
+    )
+    L = 0.5  # short drift
+
+    # Angular spectrum propagation (our own)
+    ref_as = simulate_drift_propagation(wfr, L)
+
+    # SRW propagation with standard angular mode (AT=0)
+    params = {'analyt_treat': 0, 'pxm': 1.0, 'pxd': 1.0,
+              'pzm': 1.0, 'pzd': 1.0}
+    ref_srw = srw_propagate(wfr, L, params)
+
+    # Compare intensities on the common grid
+    acc = compute_accuracy(ref_as, ref_srw)
+    print(f"✓ SRW vs angular spectrum (simple beam): accuracy={acc:.4f}")
+    assert acc > 0.9, f"SRW and angular spectrum should agree for simple beam, got {acc}"
+
+
+def test_srw_vs_angular_spectrum_diverging_beam():
+    """SRW and angular spectrum agree for a diverging beam with curvature."""
+    if not HAS_SRW:
+        print("⊘ SRW vs angular spectrum (diverging): skipped (srwpy not installed)")
+        return
+    from srw_param_advisor.validator import simulate_drift_propagation
+
+    wfr = generate_test_wavefront(
+        nx=256, nz=256, dx=2e-6, dz=2e-6,
+        photon_energy_eV=12000, R_x=5.0, R_z=5.0,
+        beam_sigma_x=50e-6, beam_sigma_z=50e-6,
+    )
+    L = 2.0
+
+    ref_as = simulate_drift_propagation(wfr, L)
+
+    # SRW with quad-phase moment mode (AT=1), allow grid expansion
+    params = {'analyt_treat': 1, 'pxm': 2.0, 'pxd': 1.0,
+              'pzm': 2.0, 'pzd': 1.0}
+    ref_srw = srw_propagate(wfr, L, params)
+
+    acc = compute_accuracy(ref_as, ref_srw)
+    print(f"✓ SRW vs angular spectrum (diverging beam): accuracy={acc:.4f}")
+    assert acc > 0.8, f"SRW and angular spectrum should agree for diverging beam, got {acc}"
+
+
+def test_srw_energy_conservation():
+    """SRW propagation should approximately conserve energy."""
+    if not HAS_SRW:
+        print("⊘ SRW energy conservation: skipped (srwpy not installed)")
+        return
+    wfr = generate_test_wavefront(
+        nx=256, nz=256, dx=2e-6, dz=2e-6,
+        photon_energy_eV=12000, R_x=20.0, R_z=20.0,
+        beam_sigma_x=60e-6, beam_sigma_z=60e-6,
+    )
+    E_in = wfr.total_energy
+
+    params = {'analyt_treat': 1, 'pxm': 2.0, 'pxd': 1.0,
+              'pzm': 2.0, 'pzd': 1.0}
+    result = srw_propagate(wfr, drift_length=1.0, params=params)
+    E_out = result.total_energy
+
+    ratio = E_out / E_in if E_in > 0 else 0
+    print(f"✓ SRW energy conservation: E_out/E_in={ratio:.4f}")
+    assert 0.8 < ratio < 1.2, f"Energy changed by {abs(1-ratio):.0%}"
 
 
 # ============================================================================
@@ -655,6 +794,11 @@ if __name__ == "__main__":
         test_precomputed_dataset_load_and_iterate,
         test_trainer_with_precomputed_dataset,
         test_trainer_precomputed_wraps_around,
+        test_to_srw_roundtrip,
+        test_srw_propagate_runs,
+        test_srw_vs_angular_spectrum_simple_beam,
+        test_srw_vs_angular_spectrum_diverging_beam,
+        test_srw_energy_conservation,
     ]
 
     passed = 0
