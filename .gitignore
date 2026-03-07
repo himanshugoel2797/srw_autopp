@@ -11,3 +11,4 @@ reference_cache/
 .venv/
 venv/
 runs/**
+**/data/train/**

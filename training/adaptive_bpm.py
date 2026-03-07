@@ -419,6 +419,99 @@ def compute_reference_adaptive(wfr, drift_length, verbose=False):
     return propagate_drift_adaptive(wfr, drift_length, verbose=verbose)
 
 
+def batch_compute_references(wfr_list, drift_lengths, device=None, verbose=False):
+    """
+    Compute reference propagations for a batch of wavefronts efficiently.
+
+    Keeps the GPU warm by processing all samples back-to-back without
+    returning to CPU between samples. Groups samples by grid size for
+    potential future batched-FFT optimization.
+
+    Parameters
+    ----------
+    wfr_list : list of WavefrontSnapshot
+    drift_lengths : list of float
+    device : torch.device, optional
+    verbose : bool
+
+    Returns
+    -------
+    list of (WavefrontSnapshot or None) -- None for failed samples
+    """
+    from srw_param_advisor.wavefront import WavefrontSnapshot
+
+    if device is None:
+        device = _get_device()
+
+    # Pre-warm CUDA (first kernel launch has overhead)
+    if device.type == 'cuda':
+        torch.zeros(1, device=device)
+
+    results = [None] * len(wfr_list)
+
+    for i, (wfr, L) in enumerate(zip(wfr_list, drift_lengths)):
+        try:
+            x_coords = wfr.x_coords
+            z_coords = wfr.z_coords
+            dx = float(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 1e-6
+            dz = float(z_coords[1] - z_coords[0]) if len(z_coords) > 1 else 1e-6
+            x_start = float(x_coords[0])
+            z_start = float(z_coords[0])
+            lambda_m = wfr.wavelength
+
+            # Move to GPU once
+            E_gpu = torch.from_numpy(wfr.Ex.astype(np.complex64)).to(device)
+
+            # Spectral bandwidth
+            q_max_x, q_max_z = _estimate_spectral_bandwidth(E_gpu, dx, dz)
+
+            # Pad
+            E_padded, dx_p, dz_p, xs_p, zs_p = _pad_for_propagation(
+                E_gpu, dx, dz, x_start, z_start, L,
+                q_max_x, q_max_z, lambda_m)
+            del E_gpu
+
+            # Propagate
+            nz_pad, nx_pad = E_padded.shape
+            transfer = _build_transfer_function(nx_pad, nz_pad, dx_p, dz_p, L, lambda_m, device)
+            E_ft = torch.fft.fft2(E_padded)
+            E_ft *= transfer
+            E_out = torch.fft.ifft2(E_ft)
+            del E_ft, transfer, E_padded
+
+            # Downsample
+            E_out, dx_o, dz_o, xs_o, zs_o = _downsample_field(
+                E_out, dx_p, dz_p, xs_p, zs_p, 8192, lambda_m)
+
+            # Copy back to CPU and free GPU memory
+            nz_out, nx_out = E_out.shape
+            E_out_np = E_out.cpu().numpy()
+            del E_out
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            x_out = xs_o + np.arange(nx_out) * dx_o
+            z_out = zs_o + np.arange(nz_out) * dz_o
+
+            Ez_out = np.zeros_like(E_out_np)
+
+            results[i] = WavefrontSnapshot(
+                Ex=E_out_np, Ez=Ez_out,
+                x_start=x_out[0], x_step=dx_o,
+                z_start=z_out[0], z_step=dz_o,
+                nx=nx_out, nz=nz_out,
+                photon_energy_eV=wfr.photon_energy_eV,
+                Robs_x=(wfr.Robs_x + L) if wfr.Robs_x is not None else None,
+                Robs_z=(wfr.Robs_z + L) if wfr.Robs_z is not None else None,
+            )
+        except Exception as e:
+            if verbose:
+                print(f"  batch_compute_references: sample {i} failed: {e}")
+            results[i] = None
+
+    return results
+
+
 # ============================================================================
 # Demo / test
 # ============================================================================

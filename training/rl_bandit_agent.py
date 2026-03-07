@@ -44,7 +44,7 @@ from srw_param_advisor.preprocessing import (
     PATCH_SIZE,
     N_CHANNELS,
 )
-from training.adaptive_bpm import compute_reference_adaptive
+from training.adaptive_bpm import compute_reference_adaptive, batch_compute_references
 
 
 # ============================================================================
@@ -631,7 +631,7 @@ def generate_universal_wavefront(rng, nx=256, nz=128):
 
 def _save_wavefront(path: Path, wfr: WavefrontSnapshot):
     """Save a WavefrontSnapshot to a .npz file."""
-    np.savez_compressed(
+    np.savez(
         path,
         Ex_real=wfr.Ex.real, Ex_imag=wfr.Ex.imag,
         Ez_real=wfr.Ez.real, Ez_imag=wfr.Ez.imag,
@@ -661,15 +661,49 @@ def _load_wavefront(path: Path) -> WavefrontSnapshot:
     )
 
 
+def _validate_input_wavefront(wfr):
+    """Check that beam is contained in grid (edge intensity < 1% of peak)."""
+    I_in = np.abs(wfr.Ex) ** 2
+    peak_in = I_in.max()
+    if peak_in == 0:
+        return False, "zero intensity"
+    edge_max = max(I_in[0, :].max(), I_in[-1, :].max(),
+                   I_in[:, 0].max(), I_in[:, -1].max())
+    if edge_max > 0.01 * peak_in:
+        return False, f"beam clipped ({edge_max/peak_in:.1%} of peak)"
+    return True, ""
+
+
+def _validate_output(wfr, ref):
+    """Check energy conservation and finite values of reference."""
+    if not np.all(np.isfinite(ref.Ex)):
+        return False, "non-finite values"
+    I_in = np.abs(wfr.Ex) ** 2
+    E_in_total = np.sum(I_in) * wfr.x_step * wfr.z_step
+    I_out = np.abs(ref.Ex) ** 2
+    E_out_total = np.sum(I_out) * ref.x_step * ref.z_step
+    if E_in_total > 0:
+        energy_err = abs(E_out_total - E_in_total) / E_in_total
+        if energy_err > 0.05 or not np.isfinite(energy_err):
+            return False, f"energy error {energy_err:.1%}"
+    return True, ""
+
+
 def precompute_dataset(
     output_dir: str,
     n_samples: int = 500,
     grid_sizes: List[int] = None,
     seed: int = 42,
     verbose: bool = True,
+    batch_size: int = 32,
 ) -> str:
     """
     Precompute a dataset of (wavefront, reference, drift_length) tuples.
+
+    Uses batched GPU propagation and threaded I/O for speed:
+    - Wavefronts are generated in batches on CPU
+    - References are computed in GPU batches (keeps GPU warm)
+    - Saving is done in a background thread pool (overlaps with next batch)
 
     Each sample is saved as:
       output_dir/NNNN_wfr.npz   — input wavefront
@@ -688,11 +722,15 @@ def precompute_dataset(
         Random seed for reproducibility.
     verbose : bool
         Print progress.
+    batch_size : int
+        Number of samples to process per GPU batch. Default 32.
 
     Returns
     -------
     str : Path to the output directory.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     if grid_sizes is None:
         grid_sizes = [128, 256]
 
@@ -703,73 +741,110 @@ def precompute_dataset(
     manifest = {'seed': seed, 'samples': []}
     n_saved = 0
     n_failed = 0
+    t0 = time.time()
 
-    for i in range(n_samples):
-        grid_n = rng.choice(grid_sizes)
-        wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
+    # Thread pool for background I/O (saving .npz files)
+    save_pool = ThreadPoolExecutor(max_workers=4)
+    save_futures = []
 
-        # Validate input: beam should be contained (edge intensity < 1% of peak)
-        I_in = np.abs(wfr.Ex) ** 2
-        peak_in = I_in.max()
-        if peak_in > 0:
-            edge_max = max(I_in[0, :].max(), I_in[-1, :].max(),
-                           I_in[:, 0].max(), I_in[:, -1].max())
-            if edge_max > 0.01 * peak_in:
+    def _drain_completed_saves():
+        """Remove completed futures to release memory held by their arguments."""
+        nonlocal save_futures
+        still_pending = []
+        for f in save_futures:
+            if f.done():
+                f.result()  # raise if save failed
+            else:
+                still_pending.append(f)
+        save_futures = still_pending
+
+    # Process in batches for efficient GPU utilisation
+    i = 0
+    while i < n_samples:
+        # --- Phase 1: Generate a batch of wavefronts on CPU ---
+        batch_wfrs = []
+        batch_Ls = []
+        batch_grids = []
+
+        for _ in range(min(batch_size, n_samples - i)):
+            grid_n = rng.choice(grid_sizes)
+            wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
+
+            ok, reason = _validate_input_wavefront(wfr)
+            if not ok:
                 n_failed += 1
-                if verbose:
-                    print(f"  Sample {i}: input beam clipped at grid edge "
-                          f"({edge_max/peak_in:.1%} of peak), skipping")
+                if verbose and n_failed <= 10:
+                    print(f"  Sample {i}: input {reason}, skipping")
+                i += 1
                 continue
 
-        try:
-            ref = compute_reference_adaptive(wfr, L)
-        except Exception as e:
-            n_failed += 1
-            if verbose:
-                print(f"  Sample {i}: reference computation failed ({e}), skipping")
+            batch_wfrs.append(wfr)
+            batch_Ls.append(L)
+            batch_grids.append(grid_n)
+            i += 1
+
+        if not batch_wfrs:
             continue
 
-        # Validate output: check energy conservation and finite values
-        E_in_total = np.sum(I_in) * wfr.x_step * wfr.z_step
-        I_out = np.abs(ref.Ex) ** 2
-        E_out_total = np.sum(I_out) * ref.x_step * ref.z_step
-        if E_in_total > 0:
-            energy_err = abs(E_out_total - E_in_total) / E_in_total
-            if energy_err > 0.05 or not np.isfinite(energy_err):
+        # --- Phase 2: Batch GPU propagation ---
+        refs = batch_compute_references(batch_wfrs, batch_Ls, verbose=False)
+
+        # --- Phase 3: Validate and save (I/O in background threads) ---
+        for wfr, ref, L, grid_n in zip(batch_wfrs, refs, batch_Ls, batch_grids):
+            if ref is None:
                 n_failed += 1
-                if verbose:
-                    print(f"  Sample {i}: energy not conserved "
-                          f"({energy_err:.1%} error), skipping")
                 continue
 
-        if not np.all(np.isfinite(ref.Ex)):
-            n_failed += 1
-            if verbose:
-                print(f"  Sample {i}: output contains non-finite values, skipping")
-            continue
+            ok, reason = _validate_output(wfr, ref)
+            if not ok:
+                n_failed += 1
+                if verbose and n_failed <= 10:
+                    print(f"  Output {reason}, skipping")
+                continue
 
-        idx = f"{n_saved:05d}"
-        _save_wavefront(out / f"{idx}_wfr.npz", wfr)
-        _save_wavefront(out / f"{idx}_ref.npz", ref)
+            idx = f"{n_saved:05d}"
+            wfr_path = out / f"{idx}_wfr.npz"
+            ref_path = out / f"{idx}_ref.npz"
 
-        manifest['samples'].append({
-            'index': n_saved,
-            'drift_length': float(L),
-            'grid_nx': int(grid_n),
-            'grid_nz': int(grid_n),
-        })
-        n_saved += 1
+            # Save in background thread
+            save_futures.append(save_pool.submit(_save_wavefront, wfr_path, wfr))
+            save_futures.append(save_pool.submit(_save_wavefront, ref_path, ref))
 
-        if verbose and (n_saved % 50 == 0 or n_saved == 1):
-            print(f"  Precomputed {n_saved}/{n_samples} samples ({n_failed} failed)")
+            manifest['samples'].append({
+                'index': n_saved,
+                'drift_length': float(L),
+                'grid_nx': int(grid_n),
+                'grid_nz': int(grid_n),
+            })
+            n_saved += 1
+
+        # Release memory: drain completed saves so their wavefront references
+        # can be garbage-collected, and free GPU cache between batches
+        _drain_completed_saves()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if verbose and n_saved > 0 and (n_saved % 50 < batch_size or n_saved < batch_size + 1):
+            elapsed = time.time() - t0
+            rate = n_saved / elapsed if elapsed > 0 else 0
+            print(f"  Precomputed {n_saved}/{n_samples} samples "
+                  f"({n_failed} failed, {rate:.1f} samples/s)")
+
+    # Wait for remaining saves to complete
+    for f in save_futures:
+        f.result()
+    save_pool.shutdown(wait=True)
 
     manifest['n_samples'] = n_saved
     manifest['n_failed'] = n_failed
     with open(out / 'manifest.json', 'w') as f:
         json.dump(manifest, f, indent=2)
 
+    elapsed = time.time() - t0
     if verbose:
-        print(f"Dataset saved to {out}: {n_saved} samples ({n_failed} failed)")
+        rate = n_saved / elapsed if elapsed > 0 else 0
+        print(f"Dataset saved to {out}: {n_saved} samples "
+              f"({n_failed} failed) in {elapsed:.1f}s ({rate:.1f} samples/s)")
 
     return str(out)
 
