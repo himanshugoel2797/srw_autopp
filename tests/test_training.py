@@ -15,13 +15,13 @@ from training.rl_bandit_agent import (
     prepare_analytical_prior, get_analytical_params,
     BanditAgent,
     action_to_params, apply_resize,
-    compute_accuracy, compute_cost, compute_reward,
+    compute_accuracy, compute_cost, compute_stability_reward,
+    _double_resize_params,
     generate_universal_wavefront,
     BanditTrainer,
     precompute_dataset, PrecomputedDataset,
     _save_wavefront, _load_wavefront,
 )
-from training.adaptive_bpm import compute_reference_adaptive
 from srw_param_advisor.validator import simulate_drift_propagation, generate_test_wavefront
 
 
@@ -346,7 +346,7 @@ def test_apply_resize_returns_wavefront_snapshot():
 
 
 # ============================================================================
-# Accuracy / cost / reward
+# Accuracy / cost / stability reward
 # ============================================================================
 
 def test_compute_accuracy_identical():
@@ -397,11 +397,30 @@ def test_compute_cost():
     print(f"✓ compute_cost: identity={cost_identity:.4f}, 2×larger={cost_large:.4f}")
 
 
-def test_compute_reward():
-    assert compute_reward(1.0, 0.0, lambda_cost=0.1) == 1.0
-    assert abs(compute_reward(0.8, 1.0, lambda_cost=0.1) - 0.7) < 1e-9
-    assert compute_reward(0.5, 2.0, lambda_cost=0.0) == 0.5  # no cost penalty
-    print("✓ compute_reward: accuracy - λ·cost")
+def test_compute_stability_reward():
+    """Stability reward: identical wavefronts → high stability, validator runs."""
+    wfr = _make_wavefront(nx=64, nz=64)
+    # Use the same wavefront as both result and doubled result for a basic test
+    reward, info = compute_stability_reward(wfr, wfr, wfr,
+                                            {'pxm': 1.0, 'pxd': 1.0,
+                                             'pzm': 1.0, 'pzd': 1.0})
+    assert 'validator_quality' in info
+    assert 'stability' in info
+    assert 'cost' in info
+    assert info['stability'] > 0.99, f"Identical fields should have stability~1, got {info['stability']}"
+    print(f"✓ compute_stability_reward: stability={info['stability']:.4f}, "
+          f"quality={info['validator_quality']:.4f}")
+
+
+def test_double_resize_params():
+    params = {'analyt_treat': 1, 'pxm': 1.5, 'pxd': 2.0, 'pzm': 1.0, 'pzd': 3.0}
+    doubled = _double_resize_params(params)
+    assert doubled['analyt_treat'] == 1, "AT should be unchanged"
+    assert doubled['pxm'] == 3.0
+    assert doubled['pxd'] == 4.0
+    assert doubled['pzm'] == 2.0
+    assert doubled['pzd'] == 6.0
+    print("✓ _double_resize_params: doubles resize factors, keeps AT")
 
 
 # ============================================================================
@@ -432,43 +451,6 @@ def test_generate_universal_wavefront_variety():
 
 
 # ============================================================================
-# Adaptive BPM reference
-# ============================================================================
-
-def test_compute_reference_adaptive_returns_wavefront():
-    wfr = _make_wavefront(nx=64, nz=64)
-    ref = compute_reference_adaptive(wfr, drift_length=2.0)
-    assert isinstance(ref, WavefrontSnapshot)
-    assert ref.photon_energy_eV == wfr.photon_energy_eV
-    assert np.any(np.abs(ref.Ex) > 0)
-    print("✓ compute_reference_adaptive: returns non-zero WavefrontSnapshot")
-
-
-def test_compute_reference_adaptive_energy_conserved():
-    """Total energy should be approximately conserved in free-space drift."""
-    wfr = _make_wavefront(nx=64, nz=64)
-    ref = compute_reference_adaptive(wfr, drift_length=1.0)
-    # Energy = sum(|E|^2) * dx * dz; dx*dz may differ so compare total power
-    E_in = np.sum(np.abs(wfr.Ex)**2) * wfr.x_step * wfr.z_step
-    E_out = np.sum(np.abs(ref.Ex)**2) * ref.x_step * ref.z_step
-    # Allow 5% tolerance (grid expansion changes normalization slightly)
-    assert abs(E_out - E_in) / E_in < 0.05, \
-        f"Energy not conserved: in={E_in:.3e}, out={E_out:.3e}"
-    print(f"✓ compute_reference_adaptive: energy conserved ({abs(E_out-E_in)/E_in:.2%} change)")
-
-
-def test_compute_reference_adaptive_negative_drift():
-    """Negative drift should propagate in reverse direction."""
-    wfr = _make_wavefront(nx=64, nz=64)
-    ref_fwd = compute_reference_adaptive(wfr, drift_length=+1.0)
-    ref_bwd = compute_reference_adaptive(wfr, drift_length=-1.0)
-    # Results should differ from each other and from input
-    assert not np.allclose(ref_fwd.Ex, ref_bwd.Ex), \
-        "Forward and backward drift should differ"
-    print("✓ compute_reference_adaptive: negative drift supported")
-
-
-# ============================================================================
 # BanditTrainer integration
 # ============================================================================
 
@@ -490,7 +472,8 @@ def test_trainer_history_fields():
     for entry in trainer.history:
         assert 'episode' in entry
         assert 'mean_reward' in entry
-        assert 'mean_accuracy' in entry
+        assert 'mean_stability' in entry
+        assert 'mean_validator_quality' in entry
         assert 'mean_cost' in entry
         assert 'mode_dist' in entry
         assert len(entry['mode_dist']) == N_MODES
@@ -572,7 +555,6 @@ def test_precompute_dataset_creates_files():
         n = manifest['n_samples']
         assert n > 0, "Should have at least one sample"
         assert (out / '00000_wfr.npz').exists()
-        assert (out / '00000_ref.npz').exists()
     print(f"✓ precompute_dataset: created {n} samples with manifest")
 
 
@@ -585,16 +567,15 @@ def test_precomputed_dataset_load_and_iterate():
         assert len(dataset) > 0
 
         # Load a single sample
-        wfr, ref, L = dataset.load_sample(0)
+        wfr, L = dataset.load_sample(0)
         assert isinstance(wfr, WavefrontSnapshot)
-        assert isinstance(ref, WavefrontSnapshot)
         assert isinstance(L, float)
         assert L != 0
 
         # Iterate full epoch
         rng = np.random.RandomState(99)
         count = 0
-        for wfr, ref, L in dataset.iter_epoch(rng):
+        for wfr, L in dataset.iter_epoch(rng):
             count += 1
         assert count == len(dataset)
     print(f"✓ PrecomputedDataset: loaded and iterated {count} samples")
@@ -787,12 +768,10 @@ if __name__ == "__main__":
         test_compute_accuracy_range,
         test_compute_accuracy_no_overlap,
         test_compute_cost,
-        test_compute_reward,
+        test_compute_stability_reward,
+        test_double_resize_params,
         test_generate_universal_wavefront,
         test_generate_universal_wavefront_variety,
-        test_compute_reference_adaptive_returns_wavefront,
-        test_compute_reference_adaptive_energy_conserved,
-        test_compute_reference_adaptive_negative_drift,
         test_trainer_runs_without_error,
         test_trainer_history_fields,
         test_trainer_parameters_change,

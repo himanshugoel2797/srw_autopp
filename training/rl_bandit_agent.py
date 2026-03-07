@@ -4,7 +4,7 @@ RL-Based SRW Propagation Parameter Optimizer
 
 Contextual bandit agent that learns to select propagation mode (AnalTreatment
 0-5) and resize parameters (pxm, pxd, pzm, pzd) jointly, optimizing for
-accuracy against a high-resolution reference while minimizing computational cost.
+parameter stability and physical validity.
 
 Architecture:
   - ViT-style encoder: 128×128 patches with statistical embedding + transformer
@@ -13,8 +13,11 @@ Architecture:
   - Value baseline for variance reduction
   - REINFORCE with entropy bonus
 
-Reference wavefront: adaptive BPM (guaranteed correct, no parameters to tune).
-Implemented in PyTorch with autograd.
+Reward: stability-based (no reference wavefront needed).  The predicted
+parameters are validated via the PropagationValidator and then tested for
+stability by doubling all resize factors and checking that the result is
+highly correlated with the original.  Stable, validator-passing parameters
+receive a high reward.
 """
 
 import sys
@@ -36,6 +39,7 @@ from srw_param_advisor.wavefront import WavefrontSnapshot
 from srw_param_advisor.validator import (
     generate_test_wavefront,
     _estimate_beam_sigma,
+    PropagationValidator,
 )
 from srw_param_advisor.preprocessing import (
     prepare_spatial_maps,
@@ -44,7 +48,6 @@ from srw_param_advisor.preprocessing import (
     PATCH_SIZE,
     N_CHANNELS,
 )
-from training.adaptive_bpm import compute_reference_adaptive, batch_compute_references
 
 
 # ============================================================================
@@ -324,7 +327,7 @@ class BanditAgent(nn.Module):
 
 
 # ============================================================================
-# Environment: propagation + reference + reward
+# Environment: propagation + reward
 # ============================================================================
 
 def action_to_params(mode: int, resize_deltas: np.ndarray, prior: np.ndarray) -> dict:
@@ -522,9 +525,104 @@ def compute_cost(params):
     return float(np.log(max(factor, 0.1)))
 
 
-def compute_reward(accuracy, cost, lambda_cost=0.1):
-    """Reward = accuracy - λ·cost."""
-    return accuracy - lambda_cost * cost
+# ============================================================================
+# Stability-based reward (no reference wavefront needed)
+# ============================================================================
+
+_validator = PropagationValidator()
+
+
+def _double_resize_params(params):
+    """
+    Return a copy of *params* with all resize factors doubled.
+
+    The AnalTreatment mode is kept unchanged — only pxm, pxd, pzm, pzd are
+    scaled so that the output grid has 2× the range and 2× the resolution
+    on each axis.
+    """
+    return {
+        'analyt_treat': params['analyt_treat'],
+        'pxm': params['pxm'] * 2.0,
+        'pxd': params['pxd'] * 2.0,
+        'pzm': params['pzm'] * 2.0,
+        'pzd': params['pzd'] * 2.0,
+    }
+
+
+def compute_stability_reward(
+    wfr_before,
+    result,
+    result_doubled,
+    params,
+    lambda_cost=0.1,
+):
+    """
+    Stability-based reward that requires no reference wavefront.
+
+    The reward has three components:
+
+    1. **Validator quality** (0–1): the ``PropagationValidator`` checks
+       energy conservation, edge clipping, sampling adequacy, intensity
+       discontinuities, Parseval consistency, and Nyquist artifacts on the
+       propagated result.  The ``overall_quality`` score from the report is
+       used directly.
+
+    2. **Stability correlation** (0–1): the complex-field correlation
+       between the result obtained with the original parameters and the
+       result obtained with doubled resize parameters.  If the parameters
+       are sufficient, doubling them should not change the physics — so the
+       correlation should be very close to 1.
+
+    3. **Cost penalty**: ``log(pxm·pxd·pzm·pzd)`` discourages
+       unnecessarily large grids.
+
+    Final reward::
+
+        reward = validator_quality * stability_correlation - λ_cost * cost
+
+    The multiplicative combination means *both* the validator and the
+    stability check must be satisfied for a high reward.
+
+    Parameters
+    ----------
+    wfr_before : WavefrontSnapshot
+        Input wavefront (before propagation).
+    result : WavefrontSnapshot
+        Propagation result with the original parameters.
+    result_doubled : WavefrontSnapshot
+        Propagation result with doubled resize parameters.
+    params : dict
+        The original propagation parameters (for cost computation).
+    lambda_cost : float
+        Weight of the computational-cost penalty (default 0.1).
+
+    Returns
+    -------
+    reward : float
+    info : dict
+        Breakdown with keys ``validator_quality``, ``validator_passed``,
+        ``stability``, ``cost``, ``reward``.
+    """
+    # --- 1. Validator quality ---
+    report = _validator.validate(wfr_before, result, params)
+    validator_quality = report.overall_quality
+
+    # --- 2. Stability correlation ---
+    stability = compute_accuracy(result, result_doubled)
+
+    # --- 3. Cost ---
+    cost = compute_cost(params)
+
+    reward = validator_quality * stability - lambda_cost * cost
+
+    info = {
+        'validator_quality': validator_quality,
+        'validator_passed': report.passed,
+        'stability': stability,
+        'cost': cost,
+        'reward': reward,
+    }
+    return reward, info
 
 
 # ============================================================================
@@ -615,35 +713,27 @@ def generate_universal_wavefront(rng, nx=256, nz=128):
         E += 10 ** rng.uniform(-3, -1) * amp.max() * (rng.randn(nz, nx) + 1j * rng.randn(nz, nx))
 
     # Randomly apply apertures (~25% of samples)
-    # Use smooth (tapered) edges to avoid hard discontinuities that would
-    # introduce high-frequency ringing and aliasing artifacts.
+    # Hard-edged apertures are physically realistic (e.g. slits, pinholes)
+    # and stress-test the propagator's handling of sharp discontinuities.
     if rng.random() < 0.25:
-        # Edge taper width: 3-10 pixels, expressed in physical units
-        taper_px = rng.uniform(3, 10)
 
         if rng.random() < 0.5:
-            # --- Rectangular aperture ---
+            # --- Rectangular aperture (hard edge) ---
             # Half-widths: between 30% and 90% of grid half-extent
             frac_x = rng.uniform(0.3, 0.9)
             frac_z = rng.uniform(0.3, 0.9)
             half_ax = frac_x * grid_half_x
             half_az = frac_z * grid_half_z
-            taper_x = taper_px * dx
-            taper_z = taper_px * dz
 
-            # Smooth rectangular mask via product of 1D tanh edges
-            rect_x = 0.5 * (np.tanh((half_ax - np.abs(X)) / taper_x) + 1.0)
-            rect_z = 0.5 * (np.tanh((half_az - np.abs(Z)) / taper_z) + 1.0)
-            aperture = rect_x * rect_z
+            aperture = ((np.abs(X) <= half_ax) & (np.abs(Z) <= half_az)).astype(E.dtype)
         else:
-            # --- Circular aperture ---
+            # --- Circular aperture (hard edge) ---
             # Radius: between 30% and 90% of the smaller grid half-extent
             frac_r = rng.uniform(0.3, 0.9)
             radius = frac_r * min(grid_half_x, grid_half_z)
-            taper_r = taper_px * min(dx, dz)
 
             R_dist = np.sqrt(X**2 + Z**2)
-            aperture = 0.5 * (np.tanh((radius - R_dist) / taper_r) + 1.0)
+            aperture = (R_dist <= radius).astype(E.dtype)
 
         E *= aperture
 
@@ -707,20 +797,6 @@ def _validate_input_wavefront(wfr):
     return True, ""
 
 
-def _validate_output(wfr, ref):
-    """Check energy conservation and finite values of reference."""
-    if not np.all(np.isfinite(ref.Ex)):
-        return False, "non-finite values"
-    I_in = np.abs(wfr.Ex) ** 2
-    E_in_total = np.sum(I_in) * wfr.x_step * wfr.z_step
-    I_out = np.abs(ref.Ex) ** 2
-    E_out_total = np.sum(I_out) * ref.x_step * ref.z_step
-    if E_in_total > 0:
-        energy_err = abs(E_out_total - E_in_total) / E_in_total
-        if energy_err > 0.05 or not np.isfinite(energy_err):
-            return False, f"energy error {energy_err:.1%}"
-    return True, ""
-
 
 def precompute_dataset(
     output_dir: str,
@@ -731,16 +807,14 @@ def precompute_dataset(
     batch_size: int = 32,
 ) -> str:
     """
-    Precompute a dataset of (wavefront, reference, drift_length) tuples.
+    Precompute a dataset of (wavefront, drift_length) tuples.
 
-    Uses batched GPU propagation and threaded I/O for speed:
-    - Wavefronts are generated in batches on CPU
-    - References are computed in GPU batches (keeps GPU warm)
-    - Saving is done in a background thread pool (overlaps with next batch)
+    No reference wavefronts are computed — the stability-based reward
+    does not need them.  Only the input wavefront and drift length are
+    saved, making dataset generation much faster.
 
     Each sample is saved as:
       output_dir/NNNN_wfr.npz   — input wavefront
-      output_dir/NNNN_ref.npz   — reference (adaptive BPM) wavefront
     Plus a manifest: output_dir/manifest.json with drift lengths and metadata.
 
     Parameters
@@ -756,7 +830,7 @@ def precompute_dataset(
     verbose : bool
         Print progress.
     batch_size : int
-        Number of samples to process per GPU batch. Default 32.
+        Number of samples to process per batch. Default 32.
 
     Returns
     -------
@@ -791,76 +865,37 @@ def precompute_dataset(
                 still_pending.append(f)
         save_futures = still_pending
 
-    # Process in batches for efficient GPU utilisation
-    i = 0
-    while i < n_samples:
-        # --- Phase 1: Generate a batch of wavefronts on CPU ---
-        batch_wfrs = []
-        batch_Ls = []
-        batch_grids = []
+    for i in range(n_samples):
+        grid_n = rng.choice(grid_sizes)
+        wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
 
-        for _ in range(min(batch_size, n_samples - i)):
-            grid_n = rng.choice(grid_sizes)
-            wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
-
-            ok, reason = _validate_input_wavefront(wfr)
-            if not ok:
-                n_failed += 1
-                if verbose and n_failed <= 10:
-                    print(f"  Sample {i}: input {reason}, skipping")
-                i += 1
-                continue
-
-            batch_wfrs.append(wfr)
-            batch_Ls.append(L)
-            batch_grids.append(grid_n)
-            i += 1
-
-        if not batch_wfrs:
+        ok, reason = _validate_input_wavefront(wfr)
+        if not ok:
+            n_failed += 1
+            if verbose and n_failed <= 10:
+                print(f"  Sample {i}: input {reason}, skipping")
             continue
 
-        # --- Phase 2: Batch GPU propagation ---
-        refs = batch_compute_references(batch_wfrs, batch_Ls, verbose=False)
+        idx = f"{n_saved:05d}"
+        wfr_path = out / f"{idx}_wfr.npz"
+        save_futures.append(save_pool.submit(_save_wavefront, wfr_path, wfr))
 
-        # --- Phase 3: Validate and save (I/O in background threads) ---
-        for wfr, ref, L, grid_n in zip(batch_wfrs, refs, batch_Ls, batch_grids):
-            if ref is None:
-                n_failed += 1
-                continue
+        manifest['samples'].append({
+            'index': n_saved,
+            'drift_length': float(L),
+            'grid_nx': int(grid_n),
+            'grid_nz': int(grid_n),
+        })
+        n_saved += 1
 
-            ok, reason = _validate_output(wfr, ref)
-            if not ok:
-                n_failed += 1
-                if verbose and n_failed <= 10:
-                    print(f"  Output {reason}, skipping")
-                continue
+        # Periodically drain completed saves to free memory
+        if n_saved % batch_size == 0:
+            _drain_completed_saves()
 
-            idx = f"{n_saved:05d}"
-            wfr_path = out / f"{idx}_wfr.npz"
-            ref_path = out / f"{idx}_ref.npz"
-
-            # Save in background thread
-            save_futures.append(save_pool.submit(_save_wavefront, wfr_path, wfr))
-            save_futures.append(save_pool.submit(_save_wavefront, ref_path, ref))
-
-            manifest['samples'].append({
-                'index': n_saved,
-                'drift_length': float(L),
-                'grid_nx': int(grid_n),
-                'grid_nz': int(grid_n),
-            })
-            n_saved += 1
-
-        # Release memory: drain completed saves so their wavefront references
-        # can be garbage-collected, and free GPU cache between batches
-        _drain_completed_saves()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        if verbose and n_saved > 0 and (n_saved % 50 < batch_size or n_saved < batch_size + 1):
+        if verbose and n_saved > 0 and n_saved % 50 == 0:
             elapsed = time.time() - t0
             rate = n_saved / elapsed if elapsed > 0 else 0
-            print(f"  Precomputed {n_saved}/{n_samples} samples "
+            print(f"  Generated {n_saved}/{n_samples} samples "
                   f"({n_failed} failed, {rate:.1f} samples/s)")
 
     # Wait for remaining saves to complete
@@ -884,12 +919,15 @@ def precompute_dataset(
 
 class PrecomputedDataset:
     """
-    Loads a precomputed dataset from disk for use in training.
+    Loads a precomputed dataset of wavefronts from disk for training.
+
+    The stability-based reward does not require reference wavefronts, so
+    the dataset only stores input wavefronts and drift lengths.
 
     Usage
     -----
         dataset = PrecomputedDataset("path/to/dataset")
-        for wfr, ref, L in dataset.iter_epoch(rng):
+        for wfr, L in dataset.iter_epoch(rng):
             ...
     """
 
@@ -903,12 +941,11 @@ class PrecomputedDataset:
         return self.n_samples
 
     def load_sample(self, idx: int):
-        """Load a single (wavefront, reference, drift_length) tuple."""
+        """Load a single (wavefront, drift_length) tuple."""
         entry = self.manifest['samples'][idx]
         prefix = f"{entry['index']:05d}"
         wfr = _load_wavefront(self.dir / f"{prefix}_wfr.npz")
-        ref = _load_wavefront(self.dir / f"{prefix}_ref.npz")
-        return wfr, ref, entry['drift_length']
+        return wfr, entry['drift_length']
 
     def iter_epoch(self, rng: np.random.RandomState = None):
         """Yield all samples in shuffled order."""
@@ -926,7 +963,11 @@ class PrecomputedDataset:
 class BanditTrainer:
     """
     Trains the contextual bandit using REINFORCE with value baseline.
-    Reference wavefronts are computed via adaptive BPM (guaranteed correct).
+
+    Reward is stability-based: propagate with predicted parameters, validate
+    with the PropagationValidator, then double all resize factors and check
+    that the complex-field correlation stays high.  No reference wavefront
+    is needed.
     """
 
     def __init__(self, agent: BanditAgent, lambda_cost=0.1, lr=3e-4,
@@ -952,8 +993,10 @@ class BanditTrainer:
             Episodes per gradient update.
         verbose : bool
         dataset : PrecomputedDataset, optional
-            If provided, samples are drawn from the precomputed dataset
-            instead of being generated on the fly.
+            If provided, wavefronts and drift lengths are drawn from the
+            precomputed dataset instead of being generated on the fly.
+            References stored in the dataset are ignored — the stability-
+            based reward is computed from scratch each time.
         """
         rng = np.random.RandomState(42)
 
@@ -968,6 +1011,7 @@ class BanditTrainer:
                   f"batch={batch_size}, λ_cost={self.lambda_cost}, data={source}")
             print(f"Agent: D={self.agent.D}, {self.agent.n_blocks} transformer blocks, "
                   f"{n_params:,} parameters")
+            print(f"Reward: stability-based (validator quality × doubled-param correlation)")
 
         t0 = time.time()
 
@@ -975,7 +1019,8 @@ class BanditTrainer:
             actual_batch = min(batch_size, n_episodes - ep)
 
             batch_rewards = []
-            batch_accuracies = []
+            batch_stabilities = []
+            batch_qualities = []
             batch_costs = []
             batch_modes = []
             batch_loss = torch.tensor(0.0)
@@ -987,19 +1032,13 @@ class BanditTrainer:
             for b in range(actual_batch):
                 if dataset is not None:
                     try:
-                        wfr, ref, L = next(dataset_iter)
+                        wfr, L = next(dataset_iter)
                     except StopIteration:
                         dataset_iter = iter(dataset.iter_epoch(rng))
-                        wfr, ref, L = next(dataset_iter)
+                        wfr, L = next(dataset_iter)
                 else:
                     grid_n = rng.choice([128, 256])
                     wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
-
-                    # Guaranteed-correct reference via adaptive BPM
-                    try:
-                        ref = compute_reference_adaptive(wfr, L)
-                    except Exception:
-                        continue
 
                 spatial = prepare_spatial_maps(wfr)
                 prior = prepare_analytical_prior(wfr, L)
@@ -1009,16 +1048,25 @@ class BanditTrainer:
                     self.agent.sample_action(spatial, prior)
 
                 params = action_to_params(mode, resize_deltas, prior)
+                doubled_params = _double_resize_params(params)
 
-                # Evaluate proposed parameters via propagation
+                # Propagate with original and doubled parameters
                 try:
                     result = self.propagate_fn(wfr, L, params)
-                    acc = compute_accuracy(result, ref)
+                    result_doubled = self.propagate_fn(wfr, L, doubled_params)
+                    reward, info = compute_stability_reward(
+                        wfr, result, result_doubled, params, self.lambda_cost,
+                    )
                 except Exception:
-                    acc = 0.0
+                    reward = 0.0
+                    info = {
+                        'validator_quality': 0.0,
+                        'validator_passed': False,
+                        'stability': 0.0,
+                        'cost': compute_cost(params),
+                        'reward': 0.0,
+                    }
 
-                cst = compute_cost(params)
-                reward = compute_reward(acc, cst, self.lambda_cost)
                 reward_t = torch.tensor(reward, dtype=torch.float32)
 
                 # REINFORCE loss with value baseline
@@ -1031,8 +1079,9 @@ class BanditTrainer:
                 n_valid += 1
 
                 batch_rewards.append(reward)
-                batch_accuracies.append(acc)
-                batch_costs.append(cst)
+                batch_stabilities.append(info['stability'])
+                batch_qualities.append(info['validator_quality'])
+                batch_costs.append(info['cost'])
                 batch_modes.append(mode)
 
             if n_valid == 0:
@@ -1043,20 +1092,23 @@ class BanditTrainer:
             self.optimizer.step()
 
             mean_reward = np.mean(batch_rewards)
-            mean_acc = np.mean(batch_accuracies)
+            mean_stability = np.mean(batch_stabilities)
+            mean_quality = np.mean(batch_qualities)
             mean_cost = np.mean(batch_costs)
 
             self.history.append({
                 'episode': ep,
                 'mean_reward': mean_reward,
-                'mean_accuracy': mean_acc,
+                'mean_stability': mean_stability,
+                'mean_validator_quality': mean_quality,
                 'mean_cost': mean_cost,
                 'mode_dist': np.bincount(batch_modes, minlength=N_MODES).tolist(),
             })
 
             step = ep // batch_size
             self.writer.add_scalar('train/reward', mean_reward, step)
-            self.writer.add_scalar('train/accuracy', mean_acc, step)
+            self.writer.add_scalar('train/stability', mean_stability, step)
+            self.writer.add_scalar('train/validator_quality', mean_quality, step)
             self.writer.add_scalar('train/cost', mean_cost, step)
             self.writer.add_scalar('train/loss', (batch_loss / n_valid).item(), step)
             mode_counts = np.bincount(batch_modes, minlength=N_MODES)
@@ -1068,8 +1120,8 @@ class BanditTrainer:
                 mode_counts = np.bincount(batch_modes, minlength=N_MODES)
                 mode_str = " ".join(f"AT{i}:{c}" for i, c in enumerate(mode_counts) if c > 0)
                 print(f"  ep {ep+actual_batch:4d} | R={mean_reward:+.3f} | "
-                      f"acc={mean_acc:.3f} | cost={mean_cost:.2f} | "
-                      f"modes: {mode_str} | {elapsed:.0f}s")
+                      f"stab={mean_stability:.3f} | qual={mean_quality:.3f} | "
+                      f"cost={mean_cost:.2f} | modes: {mode_str} | {elapsed:.0f}s")
 
         self.writer.flush()
 
@@ -1161,74 +1213,87 @@ def predict(agent: BanditAgent, wfr: WavefrontSnapshot, drift_length: float,
     )
 
 
-def evaluate(agent, n_test=30, verbose=True, writer=None, global_step=None):
-    """Evaluate agent vs analytical baseline on new configurations."""
+def evaluate(agent, n_test=30, verbose=True, writer=None, global_step=None,
+             propagate_fn=None):
+    """Evaluate agent vs analytical baseline using stability-based reward."""
     agent.eval()
     rng = np.random.RandomState(999)
+    _propagate = propagate_fn or srw_propagate
 
-    agent_accs, baseline_accs = [], []
+    agent_rewards, baseline_rewards = [], []
+    agent_stabs, baseline_stabs = [], []
+    agent_quals, baseline_quals = [], []
     agent_costs, baseline_costs = [], []
 
     for i in range(n_test):
         wfr, L = generate_universal_wavefront(rng, nx=rng.choice([128, 256]),
                                                 nz=rng.choice([128, 256]))
-        try:
-            ref = compute_reference_adaptive(wfr, L)
-        except Exception:
-            continue
 
-        # Agent prediction
+        # --- Agent prediction ---
         pred = predict(agent, wfr, L)
         pred_params = {'analyt_treat': pred.analyt_treat,
                        'pxm': pred.pxm, 'pxd': pred.pxd,
                        'pzm': pred.pzm, 'pzd': pred.pzd}
         try:
-            res_a = srw_propagate(wfr, L, pred_params)
-            acc_a = compute_accuracy(res_a, ref)
+            res_a = _propagate(wfr, L, pred_params)
+            res_a_dbl = _propagate(wfr, L, _double_resize_params(pred_params))
+            reward_a, info_a = compute_stability_reward(
+                wfr, res_a, res_a_dbl, pred_params)
         except Exception:
-            acc_a = 0.0
-        cost_a = compute_cost(pred_params)
+            reward_a = 0.0
+            info_a = {'stability': 0.0, 'validator_quality': 0.0,
+                      'cost': compute_cost(pred_params)}
 
-        # Baseline: analytical params, no correction
+        # --- Baseline: analytical params, no correction ---
         prior = prepare_analytical_prior(wfr, L)
         ap = get_analytical_params(prior)
         base_params = {'analyt_treat': ap['AT'],
                        'pxm': ap['pxm'], 'pxd': ap['pxd'],
                        'pzm': ap['pzm'], 'pzd': ap['pzd']}
         try:
-            res_b = srw_propagate(wfr, L, base_params)
-            acc_b = compute_accuracy(res_b, ref)
+            res_b = _propagate(wfr, L, base_params)
+            res_b_dbl = _propagate(wfr, L, _double_resize_params(base_params))
+            reward_b, info_b = compute_stability_reward(
+                wfr, res_b, res_b_dbl, base_params)
         except Exception:
-            acc_b = 0.0
-        cost_b = compute_cost(ap)
+            reward_b = 0.0
+            info_b = {'stability': 0.0, 'validator_quality': 0.0,
+                      'cost': compute_cost(base_params)}
 
-        agent_accs.append(acc_a)
-        baseline_accs.append(acc_b)
-        agent_costs.append(cost_a)
-        baseline_costs.append(cost_b)
+        agent_rewards.append(reward_a)
+        baseline_rewards.append(reward_b)
+        agent_stabs.append(info_a['stability'])
+        baseline_stabs.append(info_b['stability'])
+        agent_quals.append(info_a['validator_quality'])
+        baseline_quals.append(info_b['validator_quality'])
+        agent_costs.append(info_a['cost'])
+        baseline_costs.append(info_b['cost'])
 
-    if verbose and agent_accs:
-        print(f"\nEvaluation ({len(agent_accs)} test cases):")
-        print(f"  {'':20s} {'Accuracy':>10s} {'Cost':>8s} {'Reward':>10s}")
-        print(f"  {'Analytical baseline':20s} {np.mean(baseline_accs):10.4f} "
+    if verbose and agent_rewards:
+        print(f"\nEvaluation ({len(agent_rewards)} test cases):")
+        print(f"  {'':20s} {'Stability':>10s} {'Quality':>10s} {'Cost':>8s} {'Reward':>10s}")
+        print(f"  {'Analytical baseline':20s} {np.mean(baseline_stabs):10.4f} "
+              f"{np.mean(baseline_quals):10.4f} "
               f"{np.mean(baseline_costs):8.2f} "
-              f"{np.mean([a - 0.1*c for a,c in zip(baseline_accs, baseline_costs)]):10.4f}")
-        print(f"  {'RL agent':20s} {np.mean(agent_accs):10.4f} "
+              f"{np.mean(baseline_rewards):10.4f}")
+        print(f"  {'RL agent':20s} {np.mean(agent_stabs):10.4f} "
+              f"{np.mean(agent_quals):10.4f} "
               f"{np.mean(agent_costs):8.2f} "
-              f"{np.mean([a - 0.1*c for a,c in zip(agent_accs, agent_costs)]):10.4f}")
-        imp = np.sum(np.array(agent_accs) > np.array(baseline_accs))
-        print(f"  Agent beats baseline: {imp}/{len(agent_accs)} cases")
+              f"{np.mean(agent_rewards):10.4f}")
+        imp = np.sum(np.array(agent_rewards) > np.array(baseline_rewards))
+        print(f"  Agent beats baseline: {imp}/{len(agent_rewards)} cases")
 
-    if writer is not None and agent_accs:
+    if writer is not None and agent_rewards:
         s = global_step if global_step is not None else 0
-        writer.add_scalar('eval/agent_accuracy', np.mean(agent_accs), s)
-        writer.add_scalar('eval/baseline_accuracy', np.mean(baseline_accs), s)
+        writer.add_scalar('eval/agent_reward', np.mean(agent_rewards), s)
+        writer.add_scalar('eval/baseline_reward', np.mean(baseline_rewards), s)
+        writer.add_scalar('eval/agent_stability', np.mean(agent_stabs), s)
+        writer.add_scalar('eval/agent_quality', np.mean(agent_quals), s)
         writer.add_scalar('eval/agent_cost', np.mean(agent_costs), s)
-        writer.add_scalar('eval/agent_reward',
-                          np.mean([a - 0.1*c for a, c in zip(agent_accs, agent_costs)]), s)
-        writer.add_scalar('eval/win_rate', np.sum(np.array(agent_accs) > np.array(baseline_accs)) / len(agent_accs), s)
+        win_rate = np.sum(np.array(agent_rewards) > np.array(baseline_rewards)) / len(agent_rewards)
+        writer.add_scalar('eval/win_rate', win_rate, s)
 
-    return agent_accs, baseline_accs
+    return agent_rewards, baseline_rewards
 
 
 # ============================================================================
