@@ -37,8 +37,11 @@ def cmd_generate_dataset(args):
 def cmd_pretrain(args):
     import torch
     from training.rl_bandit_agent import (
-        BanditAgent, CNNPretrainer, PrecomputedDataset,
+        BanditAgent, CNNPretrainer, PrecomputedDataset, _get_device,
     )
+
+    device = torch.device(args.device) if args.device else _get_device()
+    print(f"Using device: {device}")
 
     agent = BanditAgent(D=args.embed_dim, n_transformer_blocks=args.n_blocks)
 
@@ -53,7 +56,7 @@ def cmd_pretrain(args):
         print(f"Dataset: {len(dataset)} samples from {args.dataset}")
 
     pretrainer = CNNPretrainer(
-        agent, lr=args.lr, log_dir=args.log_dir,
+        agent, lr=args.lr, log_dir=args.log_dir, device=device,
     )
     pretrainer.train(
         n_epochs=args.n_epochs,
@@ -64,8 +67,9 @@ def cmd_pretrain(args):
 
     if args.save:
         os.makedirs(os.path.dirname(args.save) or '.', exist_ok=True)
+        # Save weights on CPU for portability
         torch.save({
-            'agent_state_dict': agent.state_dict(),
+            'agent_state_dict': {k: v.cpu() for k, v in agent.state_dict().items()},
             'pretrain_history': pretrainer.history,
             'args': vars(args),
         }, args.save)
@@ -75,10 +79,11 @@ def cmd_pretrain(args):
 def cmd_train(args):
     import torch
     from training.rl_bandit_agent import (
-        BanditAgent, BanditTrainer, PrecomputedDataset,
+        BanditAgent, BanditTrainer, PrecomputedDataset, _get_device,
     )
 
-    device = torch.device(args.device) if args.device else None
+    device = torch.device(args.device) if args.device else _get_device()
+    print(f"Using device: {device}")
 
     # Load or create agent
     agent = BanditAgent(D=args.embed_dim, n_transformer_blocks=args.n_blocks)
@@ -116,6 +121,7 @@ def cmd_train(args):
         lr=args.lr,
         entropy_coeff=args.entropy_coeff,
         log_dir=args.log_dir,
+        device=device,
     )
 
     # Restore optimizer state if resuming
@@ -129,11 +135,11 @@ def cmd_train(args):
         dataset=dataset,
     )
 
-    # Save checkpoint
+    # Save checkpoint (weights on CPU for portability)
     if args.save:
         os.makedirs(os.path.dirname(args.save) or '.', exist_ok=True)
         torch.save({
-            'agent_state_dict': agent.state_dict(),
+            'agent_state_dict': {k: v.cpu() for k, v in agent.state_dict().items()},
             'optimizer_state_dict': trainer.optimizer.state_dict(),
             'history': trainer.history,
             'args': vars(args),
@@ -187,6 +193,8 @@ def main():
                     help='Path to save pretrained checkpoint (.pt)')
     pt.add_argument('--log-dir',
                     help='TensorBoard log directory')
+    pt.add_argument('--device',
+                    help='Torch device (e.g. cuda, cpu). Default: auto')
     pt.add_argument('--quiet', '-q', action='store_true',
                     help='Suppress progress output')
 
