@@ -1,0 +1,9 @@
+numpy>=1.21
+scipy>=1.7
+
+# Optional: for production training
+# torch>=2.0
+# scikit-learn>=1.0
+
+# Optional: for SRW integration
+# srwpy
