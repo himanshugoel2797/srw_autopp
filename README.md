@@ -37,8 +37,7 @@ This project automates that selection.
 - **Contextual bandit**: single-step decision per drift space (not sequential RL)
 - **State**: 5-channel physics-normalised spatial maps (128x128 patches) + 12 analytical prior scalars
 - **Action**: propagation mode (5-class categorical) + resize corrections (4 continuous, log-space) -- jointly selected via mode-conditional policy
-- **Reward**: complex field correlation against high-resolution reference - lambda x computational cost
-- **Training oracle**: SRW itself is used to propagate with the agent's chosen parameters; an adaptive angular spectrum method provides the ground-truth reference
+- **Reward**: stability-based (no reference wavefront needed). The agent's predicted parameters are validated using physics-based diagnostics, then tested for stability by doubling all resize factors and checking that the result is highly correlated with the original. Reward = validator_quality * stability_correlation - lambda * cost
 
 ### Key Design Decisions
 
@@ -85,7 +84,7 @@ srw-parameter-advisor/
 │   ├── __main__.py              # python -m training entry point
 │   ├── cli.py                   # CLI for dataset generation and training
 │   ├── rl_bandit_agent.py       # CNN+ViT encoder + mode-conditional policy + training loop
-│   └── adaptive_bpm.py          # Adaptive angular spectrum reference propagator
+│   └── adaptive_bpm.py          # Adaptive angular spectrum propagator (utility)
 │
 ├── tests/                       # Tests
 │   ├── test_preprocessing.py
@@ -119,7 +118,7 @@ Requires `srwpy` for SRW propagation (training and evaluation).
 ### Dataset Generation
 
 ```bash
-# Precompute training dataset (wavefront + reference pairs)
+# Precompute training dataset (wavefronts only, no references needed)
 python -m training generate-dataset --output-dir data/train --n-samples 500
 
 # With custom grid sizes
@@ -229,14 +228,13 @@ Attention pool + Max pool -> combined (3*D)
 - Analytical parameter estimator (Stage 1)
 - Physics-normalised spatial map preparation (Nyquist-fraction phase gradients)
 - CNN + ViT architecture with mode-conditional policy (PyTorch, autograd)
-- Universal parametric wavefront generator (super-Gaussian, aberrations, ring structure)
-- Complete RL training loop (REINFORCE with value baseline)
+- Universal parametric wavefront generator (super-Gaussian, aberrations, ring structure, hard-edged apertures)
+- Complete RL training loop (REINFORCE with value baseline, stability-based reward)
 - SRW integration for training propagation
-- Adaptive angular spectrum reference propagator (GPU-accelerated)
-- Precomputed dataset generation and loading
+- Precomputed dataset generation and loading (no reference wavefronts needed)
 - CLI for dataset generation and training with checkpoint save/resume
 - TensorBoard logging
-- SRW cross-validation tests (angular spectrum agreement > 98%)
+- SRW cross-validation tests
 
 ## Design Rationale
 

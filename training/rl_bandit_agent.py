@@ -713,35 +713,27 @@ def generate_universal_wavefront(rng, nx=256, nz=128):
         E += 10 ** rng.uniform(-3, -1) * amp.max() * (rng.randn(nz, nx) + 1j * rng.randn(nz, nx))
 
     # Randomly apply apertures (~25% of samples)
-    # Use smooth (tapered) edges to avoid hard discontinuities that would
-    # introduce high-frequency ringing and aliasing artifacts.
+    # Hard-edged apertures are physically realistic (e.g. slits, pinholes)
+    # and stress-test the propagator's handling of sharp discontinuities.
     if rng.random() < 0.25:
-        # Edge taper width: 3-10 pixels, expressed in physical units
-        taper_px = rng.uniform(3, 10)
 
         if rng.random() < 0.5:
-            # --- Rectangular aperture ---
+            # --- Rectangular aperture (hard edge) ---
             # Half-widths: between 30% and 90% of grid half-extent
             frac_x = rng.uniform(0.3, 0.9)
             frac_z = rng.uniform(0.3, 0.9)
             half_ax = frac_x * grid_half_x
             half_az = frac_z * grid_half_z
-            taper_x = taper_px * dx
-            taper_z = taper_px * dz
 
-            # Smooth rectangular mask via product of 1D tanh edges
-            rect_x = 0.5 * (np.tanh((half_ax - np.abs(X)) / taper_x) + 1.0)
-            rect_z = 0.5 * (np.tanh((half_az - np.abs(Z)) / taper_z) + 1.0)
-            aperture = rect_x * rect_z
+            aperture = ((np.abs(X) <= half_ax) & (np.abs(Z) <= half_az)).astype(E.dtype)
         else:
-            # --- Circular aperture ---
+            # --- Circular aperture (hard edge) ---
             # Radius: between 30% and 90% of the smaller grid half-extent
             frac_r = rng.uniform(0.3, 0.9)
             radius = frac_r * min(grid_half_x, grid_half_z)
-            taper_r = taper_px * min(dx, dz)
 
             R_dist = np.sqrt(X**2 + Z**2)
-            aperture = 0.5 * (np.tanh((radius - R_dist) / taper_r) + 1.0)
+            aperture = (R_dist <= radius).astype(E.dtype)
 
         E *= aperture
 
