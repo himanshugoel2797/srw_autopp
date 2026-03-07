@@ -327,7 +327,7 @@ class BanditAgent(nn.Module):
 
 
 # ============================================================================
-# Environment: propagation + reference + reward
+# Environment: propagation + reward
 # ============================================================================
 
 def action_to_params(mode: int, resize_deltas: np.ndarray, prior: np.ndarray) -> dict:
