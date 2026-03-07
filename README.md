@@ -82,8 +82,8 @@ srw-parameter-advisor/
 ├── training/                    # RL training infrastructure
 │   ├── __init__.py
 │   ├── __main__.py              # python -m training entry point
-│   ├── cli.py                   # CLI for dataset generation and training
-│   ├── rl_bandit_agent.py       # CNN+ViT encoder + mode-conditional policy + training loop
+│   ├── cli.py                   # CLI for dataset generation, pretraining, and training
+│   ├── rl_bandit_agent.py       # CNN+ViT encoder, CNN pretraining, mode-conditional policy, training
 │   └── adaptive_bpm.py          # Adaptive angular spectrum propagator (utility)
 │
 ├── tests/                       # Tests
@@ -125,10 +125,42 @@ python -m training generate-dataset --output-dir data/train --n-samples 500
 python -m training generate-dataset -o data/train -n 1000 --grid-sizes 128,256
 ```
 
+### CNN Pretraining (optional but recommended)
+
+Before RL training, the CNN patch encoder can be pretrained to predict physics-meaningful features of each patch. This gives the encoder a useful initialisation that accelerates RL convergence.
+
+```bash
+# Pretrain CNN on patch feature prediction
+python -m training pretrain --dataset data/train --n-epochs 50 --save pretrained.pt
+
+# With custom settings
+python -m training pretrain -d data/train -n 100 --samples-per-epoch 128 --lr 1e-3 --save pretrained.pt
+```
+
+The pretraining task is self-supervised: the CNN learns to predict 12 features from each 128x128 patch:
+
+| Feature | Description |
+|---------|-------------|
+| Mean intensity | Average normalised intensity |
+| Max intensity | Peak normalised intensity |
+| Intensity std | Spatial variation of intensity |
+| Fill fraction | Fraction of valid (non-aliased, signal-bearing) pixels |
+| Mean sampling quality | Average inter-pixel phase quality |
+| Min sampling quality | Worst-case phase quality over valid pixels |
+| Gradient energy | Mean squared phase gradient (theta_x^2 + theta_z^2) |
+| Mean \|theta_x\| | Average horizontal phase gradient magnitude |
+| Mean \|theta_z\| | Average vertical phase gradient magnitude |
+| Edge energy fraction | Intensity at patch border / total intensity |
+| Horizontal asymmetry | Left-right intensity imbalance |
+| Vertical asymmetry | Top-bottom intensity imbalance |
+
 ### Training
 
 ```bash
-# Train with precomputed dataset
+# Train with pretrained CNN (recommended)
+python -m training train --dataset data/train --pretrained pretrained.pt --n-episodes 1000 --save model.pt
+
+# Train from scratch (no pretraining)
 python -m training train --dataset data/train --n-episodes 1000 --save model.pt
 
 # Train with on-the-fly generation
@@ -197,7 +229,7 @@ prepare_spatial_maps() -> 5 channels (C, H, W):
 extract_patches() -> (N, 5, 128, 128) non-overlapping patches
     |
     v
-CNN Patch Encoder (per patch):
+CNN Patch Encoder (per patch, optionally pretrained on feature prediction):
     Conv2d(5, 32, 7, stride=4) -> BN -> ReLU
     Conv2d(32, 64, 3, stride=2) -> BN -> ReLU
     Conv2d(64, 128, 3, stride=2) -> BN -> ReLU
@@ -232,7 +264,8 @@ Attention pool + Max pool -> combined (3*D)
 - Complete RL training loop (REINFORCE with value baseline, stability-based reward)
 - SRW integration for training propagation
 - Precomputed dataset generation and loading (no reference wavefronts needed)
-- CLI for dataset generation and training with checkpoint save/resume
+- Self-supervised CNN pretraining on patch feature prediction (12 physics-meaningful targets)
+- CLI for dataset generation, CNN pretraining, and RL training with checkpoint save/resume
 - TensorBoard logging
 - SRW cross-validation tests
 
