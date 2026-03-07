@@ -59,6 +59,15 @@ N_MODES = 5      # AnalTreatment {0, 1, 2, 3, 4}
 N_RESIZE = 4     # (pxm, pxd, pzm, pzd)
 EMBED_DIM = 256  # embedding dimension (256 with PyTorch autograd)
 
+
+def _get_device(device: Optional[torch.device] = None) -> torch.device:
+    """Return the best available device (CUDA > CPU) unless explicitly given."""
+    if device is not None:
+        return device
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
 MODE_NAMES = {
     0: "Standard angular",
     1: "Quad-phase (moment)",
@@ -162,9 +171,12 @@ PATCH_FEATURE_NAMES = [
 N_PATCH_FEATURES = len(PATCH_FEATURE_NAMES)
 
 
-def compute_patch_features(patches: np.ndarray) -> np.ndarray:
+def compute_patch_features(patches: np.ndarray, device=None) -> np.ndarray:
     """
     Compute ground-truth feature targets from raw 5-channel patches.
+
+    Fully vectorized PyTorch implementation — no Python loop over patches.
+    Uses GPU if available for significant speedup on large batches.
 
     Parameters
     ----------
@@ -175,68 +187,81 @@ def compute_patch_features(patches: np.ndarray) -> np.ndarray:
           2: θ_z / θ_nyquist [-1, 1]
           3: sampling quality [0, 1]
           4: validity mask {0, 1}
+    device : torch.device, optional
+        Computation device. Auto-detects GPU if None.
 
     Returns
     -------
     features : np.ndarray, shape (N, N_PATCH_FEATURES), float32
         All features are normalised to roughly [0, 1] or [-1, 1].
     """
-    N = patches.shape[0]
-    feats = np.zeros((N, N_PATCH_FEATURES), dtype=np.float32)
+    dev = _get_device(device)
+    t = torch.from_numpy(patches).to(dev, dtype=torch.float32)  # (N, 5, P, P)
 
-    for i in range(N):
-        ch0 = patches[i, 0]  # intensity
-        ch1 = patches[i, 1]  # theta_x
-        ch2 = patches[i, 2]  # theta_z
-        ch3 = patches[i, 3]  # sampling quality
-        ch4 = patches[i, 4]  # validity mask
+    ch0 = t[:, 0]  # (N, P, P) intensity
+    ch1 = t[:, 1]  # theta_x
+    ch2 = t[:, 2]  # theta_z
+    ch3 = t[:, 3]  # sampling quality
+    ch4 = t[:, 4]  # validity mask
 
-        valid = ch4 > 0.5
-        n_valid = valid.sum()
+    N, P, _ = ch0.shape
+    valid = ch4 > 0.5                          # (N, P, P)
+    n_valid = valid.sum(dim=(1, 2))             # (N,)
+    has_valid = n_valid > 0                     # (N,)
 
-        # Basic intensity statistics
-        feats[i, 0] = ch0.mean()
-        feats[i, 1] = ch0.max()
-        feats[i, 2] = ch0.std()
+    feats = torch.zeros(N, N_PATCH_FEATURES, device=dev)
 
-        # Fill fraction (fraction of valid pixels)
-        feats[i, 3] = ch4.mean()
+    # [0] mean intensity
+    feats[:, 0] = ch0.mean(dim=(1, 2))
+    # [1] max intensity
+    feats[:, 1] = ch0.amax(dim=(1, 2))
+    # [2] std intensity
+    feats[:, 2] = ch0.std(dim=(1, 2))
+    # [3] fill fraction
+    feats[:, 3] = ch4.mean(dim=(1, 2))
+    # [4] mean sampling quality
+    feats[:, 4] = ch3.mean(dim=(1, 2))
 
-        # Sampling quality
-        feats[i, 4] = ch3.mean()
-        feats[i, 5] = ch3[valid].min() if n_valid > 0 else 1.0
+    # [5] min sampling quality over valid pixels (1.0 if no valid pixels)
+    ch3_masked = torch.where(valid, ch3, torch.tensor(float('inf'), device=dev))
+    min_sq = ch3_masked.amin(dim=(1, 2))
+    feats[:, 5] = torch.where(has_valid, min_sq, torch.ones(N, device=dev))
 
-        # Gradient energy: mean(theta_x² + theta_z²) — already in [-1,1]²
-        feats[i, 6] = (ch1**2 + ch2**2).mean()
+    # [6] gradient energy
+    feats[:, 6] = (ch1 ** 2 + ch2 ** 2).mean(dim=(1, 2))
 
-        # Mean absolute phase gradients over valid pixels
-        feats[i, 7] = np.abs(ch1[valid]).mean() if n_valid > 0 else 0.0
-        feats[i, 8] = np.abs(ch2[valid]).mean() if n_valid > 0 else 0.0
+    # [7, 8] mean |theta_x|, |theta_z| over valid pixels
+    ch1_abs_valid = (ch1.abs() * valid).sum(dim=(1, 2))
+    ch2_abs_valid = (ch2.abs() * valid).sum(dim=(1, 2))
+    n_valid_safe = n_valid.clamp(min=1).float()
+    feats[:, 7] = torch.where(has_valid, ch1_abs_valid / n_valid_safe, torch.zeros(N, device=dev))
+    feats[:, 8] = torch.where(has_valid, ch2_abs_valid / n_valid_safe, torch.zeros(N, device=dev))
 
-        # Edge energy fraction: intensity in 2-pixel border / total
-        P = ch0.shape[0]
-        border = np.zeros_like(ch0, dtype=bool)
-        border[:2, :] = True
-        border[-2:, :] = True
-        border[:, :2] = True
-        border[:, -2:] = True
-        total_int = ch0.sum()
-        feats[i, 9] = ch0[border].sum() / total_int if total_int > 0 else 0.0
+    # [9] edge energy fraction: intensity in 2-pixel border / total
+    border = torch.zeros(P, P, device=dev, dtype=torch.bool)
+    border[:2, :] = True
+    border[-2:, :] = True
+    border[:, :2] = True
+    border[:, -2:] = True
+    border_sum = (ch0 * border.unsqueeze(0)).sum(dim=(1, 2))  # (N,)
+    total_int = ch0.sum(dim=(1, 2))                            # (N,)
+    feats[:, 9] = torch.where(total_int > 0, border_sum / total_int,
+                              torch.zeros(N, device=dev))
 
-        # Horizontal asymmetry: |left - right| / (mean + eps)
-        mid_w = P // 2
-        left_mean = ch0[:, :mid_w].mean()
-        right_mean = ch0[:, mid_w:].mean()
-        avg_int = ch0.mean() + 1e-8
-        feats[i, 10] = abs(left_mean - right_mean) / avg_int
+    # [10] horizontal asymmetry
+    mid_w = P // 2
+    left_mean = ch0[:, :, :mid_w].mean(dim=(1, 2))
+    right_mean = ch0[:, :, mid_w:].mean(dim=(1, 2))
+    avg_int = ch0.mean(dim=(1, 2)) + 1e-8
+    feats[:, 10] = (left_mean - right_mean).abs() / avg_int
 
-        # Vertical asymmetry: |top - bottom| / (mean + eps)
-        mid_h = P // 2
-        top_mean = ch0[:mid_h, :].mean()
-        bot_mean = ch0[mid_h:, :].mean()
-        feats[i, 11] = abs(top_mean - bot_mean) / avg_int
+    # [11] vertical asymmetry
+    mid_h = P // 2
+    top_mean = ch0[:, :mid_h, :].mean(dim=(1, 2))
+    bot_mean = ch0[:, mid_h:, :].mean(dim=(1, 2))
+    feats[:, 11] = (top_mean - bot_mean).abs() / avg_int
 
-    return feats
+    return feats.cpu().numpy()
 
 
 class PatchFeatureHead(nn.Module):
@@ -280,9 +305,14 @@ class CNNPretrainer:
     """
 
     def __init__(self, agent: 'BanditAgent', lr: float = 1e-3,
-                 log_dir: Optional[str] = None):
+                 log_dir: Optional[str] = None,
+                 device: Optional[torch.device] = None):
+        self.device = _get_device(device)
         self.agent = agent
-        self.feature_head = PatchFeatureHead(agent.D)
+        self.feature_head = PatchFeatureHead(agent.D).to(self.device)
+
+        # Move CNN to device
+        self.agent.patch_cnn.to(self.device)
 
         # Only train the CNN encoder and the feature head
         self.params = list(agent.patch_cnn.parameters()) + \
@@ -307,6 +337,7 @@ class CNNPretrainer:
         dataset : PrecomputedDataset, optional
             If provided, wavefronts are drawn from the dataset.
         """
+        dev = self.device
         rng = np.random.RandomState(123)
         dataset_iter = None
         if dataset is not None:
@@ -322,6 +353,7 @@ class CNNPretrainer:
             print(f"CNN pretraining: {n_epochs} epochs, "
                   f"{samples_per_epoch} samples/epoch, data={source}")
             print(f"  CNN params: {n_cnn_params:,}, head params: {n_head_params:,}")
+            print(f"  Device: {dev}")
             print(f"  Features: {N_PATCH_FEATURES} targets: "
                   f"{', '.join(PATCH_FEATURE_NAMES)}")
 
@@ -342,17 +374,18 @@ class CNNPretrainer:
                         wfr, _L = next(dataset_iter)
                 else:
                     grid_n = rng.choice([128, 256])
-                    wfr, _L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
+                    wfr, _L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n,
+                                                           device=dev)
 
                 spatial = prepare_spatial_maps(wfr)
                 patches, _positions = extract_patches(spatial)
 
-                # Compute ground-truth features
-                targets = compute_patch_features(patches)  # (N, F)
-                targets_t = torch.from_numpy(targets)
+                # Compute ground-truth features (vectorized, on device)
+                targets = compute_patch_features(patches, device=dev)  # (N, F)
+                targets_t = torch.from_numpy(targets).to(dev)
 
                 # Forward through CNN
-                patches_t = torch.from_numpy(patches)      # (N, C, P, P)
+                patches_t = torch.from_numpy(patches).to(dev)      # (N, C, P, P)
                 embeddings = self.agent.patch_cnn(patches_t)  # (N, D)
                 predictions = self.feature_head(embeddings)   # (N, F)
 
@@ -369,7 +402,7 @@ class CNNPretrainer:
                 epoch_patches += n_patches
 
                 with torch.no_grad():
-                    per_feat = (predictions - targets_t).pow(2).mean(dim=0).numpy()
+                    per_feat = (predictions - targets_t).pow(2).mean(dim=0).cpu().numpy()
                     per_feature_mse += per_feat * n_patches
 
             mean_loss = epoch_loss / max(epoch_patches, 1)
@@ -484,6 +517,11 @@ class BanditAgent(nn.Module):
         for head in self.resize_heads:
             nn.init.zeros_(head.bias)
 
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the model parameters."""
+        return next(self.parameters()).device
+
     def forward(self, spatial_maps: np.ndarray, prior_scalars: np.ndarray):
         """
         Full forward pass.
@@ -500,17 +538,19 @@ class BanditAgent(nn.Module):
         value : Tensor scalar
         combined : Tensor (3D,)
         """
+        dev = self.device
+
         # Extract patches and embed via CNN
         patches, positions = extract_patches(spatial_maps)
 
-        patches_t = torch.from_numpy(patches)  # (N, C, P, P)
-        patch_emb = self.patch_cnn(patches_t)   # (N, D)
+        patches_t = torch.from_numpy(patches).to(dev)  # (N, C, P, P)
+        patch_emb = self.patch_cnn(patches_t)           # (N, D)
 
         pos_enc = sinusoidal_position_encoding(positions, self.D)
-        patch_emb = patch_emb + torch.from_numpy(pos_enc.astype(np.float32))
+        patch_emb = patch_emb + torch.from_numpy(pos_enc.astype(np.float32)).to(dev)
 
         # Prior token
-        prior_t = torch.from_numpy(prior_scalars.astype(np.float32))
+        prior_t = torch.from_numpy(prior_scalars.astype(np.float32)).to(dev)
         prior_token = self.prior_enc(prior_t).unsqueeze(0)  # (1, D)
 
         # Sequence: [prior, patches…] → (1, N+1, D) for batch_first transformer
@@ -894,42 +934,46 @@ def compute_stability_reward(
 # Universal parametric source
 # ============================================================================
 
-def generate_universal_wavefront(rng, nx=256, nz=128):
+def generate_universal_wavefront(rng, nx=256, nz=128, device=None):
     """
     Generate a wavefront from the universal parametric distribution.
+
+    Uses PyTorch for heavy array computation and GPU if available.
 
     Guarantees:
       - Beam contained in grid (3*w < grid_half on each axis)
       - Phase properly sampled (max phase step < pi/2 per pixel)
+
+    Parameters
+    ----------
+    rng : np.random.RandomState
+        Random state for reproducible sampling.
+    nx, nz : int
+        Grid dimensions.
+    device : torch.device, optional
+        Device for tensor computation. Auto-detects GPU if None.
     """
+    dev = _get_device(device)
+
+    # --- Scalar parameter sampling (stays on CPU / Python) ---
     energy = 10 ** rng.uniform(2, 5)
     lambda_m = 1.239842e-06 / energy
     dx = 10 ** rng.uniform(-7, -4)
     dz = dx * 10 ** rng.uniform(-0.3, 0.3)
 
     k = 2 * np.pi / lambda_m
-    x = (np.arange(nx) - nx // 2) * dx
-    z = (np.arange(nz) - nz // 2) * dz
-    X, Z = np.meshgrid(x, z)
-
     grid_half_x = nx * dx / 2
     grid_half_z = nz * dz / 2
 
-    p_x = np.clip(2.0 + abs(rng.standard_cauchy()) * 1.0, 1.0, 10.0)
-    p_z = np.clip(2.0 + abs(rng.standard_cauchy()) * 1.0, 1.0, 10.0)
+    p_x = float(np.clip(2.0 + abs(rng.standard_cauchy()) * 1.0, 1.0, 10.0))
+    p_z = float(np.clip(2.0 + abs(rng.standard_cauchy()) * 1.0, 1.0, 10.0))
 
-    # Beam width: cap so 1% containment fits inside the grid.
-    # For super-Gaussian exp(-0.5*|x/w|^p), the 1% radius is
-    # r_1pct = (2*ln(100))^(1/p) * w ≈ 9.21^(1/p) * w
-    contain_x = 9.21 ** (1.0 / p_x)  # containment multiplier for x
+    contain_x = 9.21 ** (1.0 / p_x)
     contain_z = 9.21 ** (1.0 / p_z)
     fill = 10 ** rng.uniform(-0.5, 0.0)
-    w_x = np.clip(fill * grid_half_x * 0.25, dx * 2, grid_half_x / contain_x)
-    w_z = np.clip(w_x * 10 ** rng.uniform(-0.3, 0.3), dz * 2, grid_half_z / contain_z)
+    w_x = float(np.clip(fill * grid_half_x * 0.25, dx * 2, grid_half_x / contain_x))
+    w_z = float(np.clip(w_x * 10 ** rng.uniform(-0.3, 0.3), dz * 2, grid_half_z / contain_z))
 
-    # Curvature: ensure phase step at beam edge is < pi/2 per pixel.
-    # Phase gradient = k*x/R, step/pixel = k*x_edge*dx/R < pi/2
-    # x_edge = contain * w, so |R| > 2*k*contain*w*dx / pi = 4*contain*w*dx / lambda
     R_min_x = 4 * contain_x * w_x * dx / lambda_m
     R_min_z = 4 * contain_z * w_z * dz / lambda_m
 
@@ -942,71 +986,86 @@ def generate_universal_wavefront(rng, nx=256, nz=128):
         R_x = rng.choice([-1, 1]) * 10 ** rng.uniform(log_R_min_x, 4)
         R_z = rng.choice([-1, 1]) * 10 ** rng.uniform(log_R_min_z, 4)
 
-    xn, zn = X / w_x, Z / w_z
-    amp = np.exp(-0.5 * (np.abs(xn)**p_x + np.abs(zn)**p_z))
+    # --- Grid computation on device (GPU if available) ---
+    x_t = (torch.arange(nx, device=dev, dtype=torch.float64) - nx // 2) * dx
+    z_t = (torch.arange(nz, device=dev, dtype=torch.float64) - nz // 2) * dz
+    Z_t, X_t = torch.meshgrid(z_t, x_t, indexing='ij')
 
+    xn = X_t / w_x
+    zn = Z_t / w_z
+
+    # Super-Gaussian amplitude
+    amp = torch.exp(-0.5 * (xn.abs().pow(p_x) + zn.abs().pow(p_z)))
+
+    # Ring modulation
     eta = 0.0 if rng.random() < 0.6 else rng.uniform(0.02, 0.4)
     if eta > 0:
-        r_norm = np.sqrt(xn**2 + zn**2)
+        r_norm = torch.sqrt(xn ** 2 + zn ** 2)
         ring_period = 10 ** rng.uniform(-0.3, 0.5)
-        amp *= (1.0 + eta * np.cos(2 * np.pi * r_norm / ring_period))
-        amp = np.maximum(amp, 0)
+        amp = amp * (1.0 + eta * torch.cos(2 * np.pi * r_norm / ring_period))
+        amp = torch.clamp(amp, min=0)
 
-    phase = np.zeros_like(X)
+    # Phase: quadratic curvature
+    phase = torch.zeros_like(X_t)
     if abs(R_x) < 1e20:
-        phase += (k / (2 * R_x)) * X**2
+        phase = phase + (k / (2 * R_x)) * X_t ** 2
     if abs(R_z) < 1e20:
-        phase += (k / (2 * R_z)) * Z**2
+        phase = phase + (k / (2 * R_z)) * Z_t ** 2
 
+    # Zernike aberrations
     if rng.random() < 0.3:
-        r_pupil = np.sqrt(xn**2 + zn**2)
-        r_max = max(r_pupil.max(), 1e-10)
+        r_pupil = torch.sqrt(xn ** 2 + zn ** 2)
+        r_max = float(r_pupil.max().item()) or 1e-10
         rho = r_pupil / r_max
-        theta = np.arctan2(zn, xn)
+        theta = torch.atan2(zn, xn)
         if rng.random() < 0.5:
-            phase += rng.exponential(0.5) * (3 * rho**3 - 2 * rho) * np.cos(theta)
+            phase = phase + rng.exponential(0.5) * (3 * rho ** 3 - 2 * rho) * torch.cos(theta)
         if rng.random() < 0.5:
-            phase += rng.exponential(0.5) * rho**2 * np.cos(2 * theta)
+            phase = phase + rng.exponential(0.5) * rho ** 2 * torch.cos(2 * theta)
 
-    phase += k * rng.normal(0, 1e-5) * X
-    phase += k * rng.normal(0, 1e-5) * Z
-    phase += rng.uniform(0, 2 * np.pi)
+    # Linear phase tilt + constant offset
+    phase = phase + k * rng.normal(0, 1e-5) * X_t
+    phase = phase + k * rng.normal(0, 1e-5) * Z_t
+    phase = phase + rng.uniform(0, 2 * np.pi)
 
-    E = amp * np.exp(1j * phase)
+    # Complex field E = amp * exp(i * phase)
+    E_real = amp * torch.cos(phase)
+    E_imag = amp * torch.sin(phase)
 
+    # Noise
     if rng.random() < 0.1:
-        E += 10 ** rng.uniform(-3, -1) * amp.max() * (rng.randn(nz, nx) + 1j * rng.randn(nz, nx))
+        amp_max = float(amp.max().item())
+        noise_scale = 10 ** rng.uniform(-3, -1) * amp_max
+        noise_re = torch.tensor(rng.randn(nz, nx), device=dev, dtype=torch.float64)
+        noise_im = torch.tensor(rng.randn(nz, nx), device=dev, dtype=torch.float64)
+        E_real = E_real + noise_scale * noise_re
+        E_imag = E_imag + noise_scale * noise_im
 
-    # Randomly apply apertures (~25% of samples)
-    # Hard-edged apertures are physically realistic (e.g. slits, pinholes)
-    # and stress-test the propagator's handling of sharp discontinuities.
+    # Apertures (~25%)
     if rng.random() < 0.25:
-
         if rng.random() < 0.5:
-            # --- Rectangular aperture (hard edge) ---
-            # Half-widths: between 30% and 90% of grid half-extent
             frac_x = rng.uniform(0.3, 0.9)
             frac_z = rng.uniform(0.3, 0.9)
             half_ax = frac_x * grid_half_x
             half_az = frac_z * grid_half_z
-
-            aperture = ((np.abs(X) <= half_ax) & (np.abs(Z) <= half_az)).astype(E.dtype)
+            aperture = ((X_t.abs() <= half_ax) & (Z_t.abs() <= half_az)).to(E_real.dtype)
         else:
-            # --- Circular aperture (hard edge) ---
-            # Radius: between 30% and 90% of the smaller grid half-extent
             frac_r = rng.uniform(0.3, 0.9)
             radius = frac_r * min(grid_half_x, grid_half_z)
-
-            R_dist = np.sqrt(X**2 + Z**2)
-            aperture = (R_dist <= radius).astype(E.dtype)
-
-        E *= aperture
+            R_dist = torch.sqrt(X_t ** 2 + Z_t ** 2)
+            aperture = (R_dist <= radius).to(E_real.dtype)
+        E_real = E_real * aperture
+        E_imag = E_imag * aperture
 
     L = rng.choice([-1, 1]) * 10 ** rng.uniform(-1, 2)
 
+    # Transfer back to CPU numpy for WavefrontSnapshot
+    E_np = (E_real.cpu().numpy() + 1j * E_imag.cpu().numpy())
+    x_np = x_t.cpu().numpy()
+
     wfr = WavefrontSnapshot(
-        Ex=E, Ez=np.zeros_like(E),
-        x_start=x[0], x_step=dx, z_start=z[0], z_step=dz,
+        Ex=E_np, Ez=np.zeros_like(E_np),
+        x_start=float(x_np[0]), x_step=dx, z_start=float(z_t[0].cpu().item()), z_step=dz,
         nx=nx, nz=nz, photon_energy_eV=energy,
         Robs_x=R_x, Robs_z=R_z)
 
@@ -1236,8 +1295,10 @@ class BanditTrainer:
     """
 
     def __init__(self, agent: BanditAgent, lambda_cost=0.1, lr=3e-4,
-                 entropy_coeff=0.01, log_dir=None, propagate_fn=None):
-        self.agent = agent
+                 entropy_coeff=0.01, log_dir=None, propagate_fn=None,
+                 device: Optional[torch.device] = None):
+        self.device = _get_device(device)
+        self.agent = agent.to(self.device)
         self.lambda_cost = lambda_cost
         self.entropy_coeff = entropy_coeff
         self.optimizer = torch.optim.Adam(agent.parameters(), lr=lr)
@@ -1263,6 +1324,7 @@ class BanditTrainer:
             References stored in the dataset are ignored — the stability-
             based reward is computed from scratch each time.
         """
+        dev = self.device
         rng = np.random.RandomState(42)
 
         # Set up sample iterator from precomputed dataset if provided
@@ -1276,6 +1338,7 @@ class BanditTrainer:
                   f"batch={batch_size}, λ_cost={self.lambda_cost}, data={source}")
             print(f"Agent: D={self.agent.D}, {self.agent.n_blocks} transformer blocks, "
                   f"{n_params:,} parameters")
+            print(f"Device: {dev}")
             print(f"Reward: stability-based (validator quality × doubled-param correlation)")
 
         t0 = time.time()
@@ -1288,7 +1351,7 @@ class BanditTrainer:
             batch_qualities = []
             batch_costs = []
             batch_modes = []
-            batch_loss = torch.tensor(0.0)
+            batch_loss = torch.tensor(0.0, device=dev)
             n_valid = 0
 
             self.agent.train()
@@ -1303,12 +1366,13 @@ class BanditTrainer:
                         wfr, L = next(dataset_iter)
                 else:
                     grid_n = rng.choice([128, 256])
-                    wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
+                    wfr, L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n,
+                                                          device=dev)
 
                 spatial = prepare_spatial_maps(wfr)
                 prior = prepare_analytical_prior(wfr, L)
 
-                # Forward + sample
+                # Forward + sample (agent is already on device)
                 mode, resize_deltas, log_prob, entropy, value, mode_probs = \
                     self.agent.sample_action(spatial, prior)
 
@@ -1332,7 +1396,7 @@ class BanditTrainer:
                         'reward': 0.0,
                     }
 
-                reward_t = torch.tensor(reward, dtype=torch.float32)
+                reward_t = torch.tensor(reward, dtype=torch.float32, device=dev)
 
                 # REINFORCE loss with value baseline
                 advantage = reward_t - value.detach()
