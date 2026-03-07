@@ -11,9 +11,8 @@ import torch.nn as nn
 from srw_param_advisor.wavefront import WavefrontSnapshot
 from srw_param_advisor.preprocessing import prepare_spatial_maps, PATCH_SIZE, N_CHANNELS
 from training.rl_bandit_agent import (
-    N_AUX, N_MODES, N_RESIZE, N_PATCH_FEAT,
+    N_AUX, N_MODES, N_RESIZE,
     prepare_analytical_prior, get_analytical_params,
-    extract_patch_features,
     BanditAgent,
     action_to_params, apply_resize,
     compute_accuracy, compute_cost, compute_reward,
@@ -113,31 +112,40 @@ def test_get_analytical_params_types_and_ranges():
 
 
 # ============================================================================
-# Patch feature extraction
+# Patch CNN encoder
 # ============================================================================
 
-def test_extract_patch_features_shape():
-    patch = np.random.randn(N_CHANNELS, PATCH_SIZE, PATCH_SIZE).astype(np.float32)
-    feats = extract_patch_features(patch)
-    assert feats.shape == (N_PATCH_FEAT,), \
-        f"Expected ({N_PATCH_FEAT},), got {feats.shape}"
-    assert feats.dtype == np.float32
-    print(f"✓ extract_patch_features: shape ({N_PATCH_FEAT},)")
+def test_patch_cnn_output_shape():
+    """CNN patch encoder produces (N, D) embeddings from raw patches."""
+    agent = _make_agent()
+    agent.eval()
+    patch = torch.randn(2, N_CHANNELS, PATCH_SIZE, PATCH_SIZE)
+    with torch.no_grad():
+        emb = agent.patch_cnn(patch)
+    assert emb.shape == (2, agent.D), f"Expected (2, {agent.D}), got {emb.shape}"
+    print(f"✓ patch_cnn: output shape (2, {agent.D})")
 
 
-def test_extract_patch_features_finite():
-    patch = np.random.randn(N_CHANNELS, PATCH_SIZE, PATCH_SIZE).astype(np.float32)
-    feats = extract_patch_features(patch)
-    assert np.isfinite(feats).all(), "Features contain non-finite values"
-    print("✓ extract_patch_features: all finite")
+def test_patch_cnn_finite_output():
+    """CNN should produce finite outputs for random input."""
+    agent = _make_agent()
+    agent.eval()
+    patch = torch.randn(1, N_CHANNELS, PATCH_SIZE, PATCH_SIZE)
+    with torch.no_grad():
+        emb = agent.patch_cnn(patch)
+    assert torch.isfinite(emb).all(), "CNN produced non-finite embeddings"
+    print("✓ patch_cnn: all finite")
 
 
-def test_extract_patch_features_zero_patch():
-    """Zero patch should not produce NaN (e.g. from 0/0 in centroid)."""
-    patch = np.zeros((N_CHANNELS, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
-    feats = extract_patch_features(patch)
-    assert np.isfinite(feats).all(), "Zero patch produced non-finite features"
-    print("✓ extract_patch_features: zero patch handled safely")
+def test_patch_cnn_zero_patch():
+    """Zero patch should not produce NaN."""
+    agent = _make_agent()
+    agent.eval()
+    patch = torch.zeros(1, N_CHANNELS, PATCH_SIZE, PATCH_SIZE)
+    with torch.no_grad():
+        emb = agent.patch_cnn(patch)
+    assert torch.isfinite(emb).all(), "Zero patch produced non-finite embeddings"
+    print("✓ patch_cnn: zero patch handled safely")
 
 
 # ============================================================================
@@ -760,9 +768,9 @@ if __name__ == "__main__":
         test_prior_at_suggestion_converging_to_waist,
         test_prior_custom_R_and_sigma,
         test_get_analytical_params_types_and_ranges,
-        test_extract_patch_features_shape,
-        test_extract_patch_features_finite,
-        test_extract_patch_features_zero_patch,
+        test_patch_cnn_output_shape,
+        test_patch_cnn_finite_output,
+        test_patch_cnn_zero_patch,
         test_agent_forward_shapes,
         test_agent_forward_finite,
         test_agent_log_std_clamped,

@@ -55,7 +55,6 @@ N_AUX = 12       # analytical prior scalars
 N_MODES = 6      # AnalTreatment {0, 1, 2, 3, 4, 5}
 N_RESIZE = 4     # (pxm, pxd, pzm, pzd)
 EMBED_DIM = 256  # embedding dimension (256 with PyTorch autograd)
-N_PATCH_FEAT = N_CHANNELS * 10  # 10 statistical features per channel
 
 MODE_NAMES = {
     0: "Standard angular",
@@ -138,44 +137,6 @@ def get_analytical_params(prior: np.ndarray) -> dict:
     }
 
 
-# ============================================================================
-# Patch feature extraction (numpy → tensor via nn.Linear)
-# ============================================================================
-
-def _weighted_centroid_x(ch):
-    w = np.abs(ch).sum(axis=0)
-    total = w.sum()
-    if total == 0:
-        return 0.5
-    return float(np.sum(np.arange(len(w)) * w) / total / max(len(w) - 1, 1))
-
-
-def _weighted_centroid_z(ch):
-    w = np.abs(ch).sum(axis=1)
-    total = w.sum()
-    if total == 0:
-        return 0.5
-    return float(np.sum(np.arange(len(w)) * w) / total / max(len(w) - 1, 1))
-
-
-def extract_patch_features(patch: np.ndarray) -> np.ndarray:
-    """
-    Extract 10 statistical features per channel from a patch.
-    patch: (C, P, P) → (C*10,) = (N_PATCH_FEAT,)
-    """
-    features = []
-    for c in range(patch.shape[0]):
-        ch = patch[c]
-        ch_abs_max = np.abs(ch).max()
-        features.extend([
-            ch.mean(), ch.std(), ch.max(), ch.min(), np.abs(ch).mean(),
-            _weighted_centroid_x(ch), _weighted_centroid_z(ch),
-            np.abs(np.diff(ch, axis=1)).mean(),
-            np.abs(np.diff(ch, axis=0)).mean(),
-            (np.abs(ch) > 0.5 * ch_abs_max).mean() if ch_abs_max != 0 else 0,
-        ])
-    return np.array(features, dtype=np.float32)
-
 
 # ============================================================================
 # Agent (PyTorch nn.Module)
@@ -192,8 +153,18 @@ class BanditAgent(nn.Module):
         self.D = D
         self.n_blocks = n_transformer_blocks
 
-        # Patch embedding: statistical features → D
-        self.patch_proj = nn.Linear(N_PATCH_FEAT, D)
+        # Patch embedding: CNN on raw (C, P, P) patches → D
+        self.patch_cnn = nn.Sequential(
+            nn.Conv2d(N_CHANNELS, 32, 7, stride=4, padding=3),   # (32, 32, 32)
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),           # (64, 16, 16)
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),          # (128, 8, 8)
+            nn.BatchNorm2d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),                              # (128, 1, 1)
+            nn.Flatten(),                                         # (128,)
+            nn.Linear(128, D),
+        )
 
         # Prior encoder: N_AUX → D
         self.prior_enc = nn.Sequential(
@@ -262,13 +233,11 @@ class BanditAgent(nn.Module):
         value : Tensor scalar
         combined : Tensor (3D,)
         """
-        # Extract and embed patches
+        # Extract patches and embed via CNN
         patches, positions = extract_patches(spatial_maps)
 
-        feats = np.stack([extract_patch_features(p) for p in patches], axis=0)  # (N, N_PATCH_FEAT)
-        feats_t = torch.from_numpy(feats)
-
-        patch_emb = self.patch_proj(feats_t)  # (N, D)
+        patches_t = torch.from_numpy(patches)  # (N, C, P, P)
+        patch_emb = self.patch_cnn(patches_t)   # (N, D)
 
         pos_enc = sinusoidal_position_encoding(positions, self.D)
         patch_emb = patch_emb + torch.from_numpy(pos_enc.astype(np.float32))
