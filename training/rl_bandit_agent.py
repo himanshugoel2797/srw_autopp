@@ -141,6 +141,271 @@ def get_analytical_params(prior: np.ndarray) -> dict:
 
 
 # ============================================================================
+# Patch feature extraction (for CNN pretraining)
+# ============================================================================
+
+# Feature names and count — kept in sync with compute_patch_features()
+PATCH_FEATURE_NAMES = [
+    'mean_intensity',       # mean of ch0 (normalised intensity)
+    'max_intensity',        # max of ch0
+    'std_intensity',        # std of ch0
+    'fill_fraction',        # mean of ch4 (validity mask)
+    'mean_sampling_quality',  # mean of ch3
+    'min_sampling_quality',   # min of ch3 over valid pixels (or 1 if none)
+    'gradient_energy',      # mean(ch1² + ch2²)
+    'mean_abs_theta_x',     # mean |ch1| over valid pixels
+    'mean_abs_theta_z',     # mean |ch2| over valid pixels
+    'edge_energy_fraction', # intensity at 2-pixel border / total intensity
+    'horizontal_asymmetry', # |mean(left) - mean(right)| / (mean + eps)
+    'vertical_asymmetry',   # |mean(top) - mean(bottom)| / (mean + eps)
+]
+N_PATCH_FEATURES = len(PATCH_FEATURE_NAMES)
+
+
+def compute_patch_features(patches: np.ndarray) -> np.ndarray:
+    """
+    Compute ground-truth feature targets from raw 5-channel patches.
+
+    Parameters
+    ----------
+    patches : np.ndarray, shape (N, 5, P, P)
+        Batch of patches with channels:
+          0: normalised intensity [0, 1]
+          1: θ_x / θ_nyquist [-1, 1]
+          2: θ_z / θ_nyquist [-1, 1]
+          3: sampling quality [0, 1]
+          4: validity mask {0, 1}
+
+    Returns
+    -------
+    features : np.ndarray, shape (N, N_PATCH_FEATURES), float32
+        All features are normalised to roughly [0, 1] or [-1, 1].
+    """
+    N = patches.shape[0]
+    feats = np.zeros((N, N_PATCH_FEATURES), dtype=np.float32)
+
+    for i in range(N):
+        ch0 = patches[i, 0]  # intensity
+        ch1 = patches[i, 1]  # theta_x
+        ch2 = patches[i, 2]  # theta_z
+        ch3 = patches[i, 3]  # sampling quality
+        ch4 = patches[i, 4]  # validity mask
+
+        valid = ch4 > 0.5
+        n_valid = valid.sum()
+
+        # Basic intensity statistics
+        feats[i, 0] = ch0.mean()
+        feats[i, 1] = ch0.max()
+        feats[i, 2] = ch0.std()
+
+        # Fill fraction (fraction of valid pixels)
+        feats[i, 3] = ch4.mean()
+
+        # Sampling quality
+        feats[i, 4] = ch3.mean()
+        feats[i, 5] = ch3[valid].min() if n_valid > 0 else 1.0
+
+        # Gradient energy: mean(theta_x² + theta_z²) — already in [-1,1]²
+        feats[i, 6] = (ch1**2 + ch2**2).mean()
+
+        # Mean absolute phase gradients over valid pixels
+        feats[i, 7] = np.abs(ch1[valid]).mean() if n_valid > 0 else 0.0
+        feats[i, 8] = np.abs(ch2[valid]).mean() if n_valid > 0 else 0.0
+
+        # Edge energy fraction: intensity in 2-pixel border / total
+        P = ch0.shape[0]
+        border = np.zeros_like(ch0, dtype=bool)
+        border[:2, :] = True
+        border[-2:, :] = True
+        border[:, :2] = True
+        border[:, -2:] = True
+        total_int = ch0.sum()
+        feats[i, 9] = ch0[border].sum() / total_int if total_int > 0 else 0.0
+
+        # Horizontal asymmetry: |left - right| / (mean + eps)
+        mid_w = P // 2
+        left_mean = ch0[:, :mid_w].mean()
+        right_mean = ch0[:, mid_w:].mean()
+        avg_int = ch0.mean() + 1e-8
+        feats[i, 10] = abs(left_mean - right_mean) / avg_int
+
+        # Vertical asymmetry: |top - bottom| / (mean + eps)
+        mid_h = P // 2
+        top_mean = ch0[:mid_h, :].mean()
+        bot_mean = ch0[mid_h:, :].mean()
+        feats[i, 11] = abs(top_mean - bot_mean) / avg_int
+
+    return feats
+
+
+class PatchFeatureHead(nn.Module):
+    """
+    MLP head that predicts patch-level features from CNN embeddings.
+
+    Used for self-supervised pretraining of the patch CNN encoder.
+    """
+
+    def __init__(self, D: int, n_features: int = N_PATCH_FEATURES):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(D, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, n_features),
+        )
+
+    def forward(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        patch_embeddings : (N, D) — output of patch_cnn
+
+        Returns
+        -------
+        predicted_features : (N, n_features)
+        """
+        return self.head(patch_embeddings)
+
+
+class CNNPretrainer:
+    """
+    Self-supervised pretraining of the patch CNN encoder.
+
+    The CNN learns to predict physics-meaningful features of each patch
+    (mean intensity, fill fraction, sampling quality, gradient energy, etc.)
+    from its raw 5-channel input.  This gives the encoder a useful
+    initialisation before RL fine-tuning.
+    """
+
+    def __init__(self, agent: 'BanditAgent', lr: float = 1e-3,
+                 log_dir: Optional[str] = None):
+        self.agent = agent
+        self.feature_head = PatchFeatureHead(agent.D)
+
+        # Only train the CNN encoder and the feature head
+        self.params = list(agent.patch_cnn.parameters()) + \
+                      list(self.feature_head.parameters())
+        self.optimizer = torch.optim.Adam(self.params, lr=lr)
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self.history: List[dict] = []
+
+    def train(self, n_epochs: int = 50, samples_per_epoch: int = 64,
+              verbose: bool = True,
+              dataset: 'PrecomputedDataset | None' = None):
+        """
+        Pretrain the patch CNN on feature prediction.
+
+        Parameters
+        ----------
+        n_epochs : int
+            Number of pretraining epochs.
+        samples_per_epoch : int
+            Wavefronts to process per epoch (each yields multiple patches).
+        verbose : bool
+        dataset : PrecomputedDataset, optional
+            If provided, wavefronts are drawn from the dataset.
+        """
+        rng = np.random.RandomState(123)
+        dataset_iter = None
+        if dataset is not None:
+            dataset_iter = iter(dataset.iter_epoch(rng))
+
+        self.agent.patch_cnn.train()
+        self.feature_head.train()
+
+        if verbose:
+            n_cnn_params = sum(p.numel() for p in self.agent.patch_cnn.parameters())
+            n_head_params = sum(p.numel() for p in self.feature_head.parameters())
+            source = f"precomputed ({len(dataset)} samples)" if dataset else "on-the-fly"
+            print(f"CNN pretraining: {n_epochs} epochs, "
+                  f"{samples_per_epoch} samples/epoch, data={source}")
+            print(f"  CNN params: {n_cnn_params:,}, head params: {n_head_params:,}")
+            print(f"  Features: {N_PATCH_FEATURES} targets: "
+                  f"{', '.join(PATCH_FEATURE_NAMES)}")
+
+        t0 = time.time()
+
+        for epoch in range(n_epochs):
+            epoch_loss = 0.0
+            epoch_patches = 0
+            per_feature_mse = np.zeros(N_PATCH_FEATURES)
+
+            for _ in range(samples_per_epoch):
+                # Get a wavefront
+                if dataset_iter is not None:
+                    try:
+                        wfr, _L = next(dataset_iter)
+                    except StopIteration:
+                        dataset_iter = iter(dataset.iter_epoch(rng))
+                        wfr, _L = next(dataset_iter)
+                else:
+                    grid_n = rng.choice([128, 256])
+                    wfr, _L = generate_universal_wavefront(rng, nx=grid_n, nz=grid_n)
+
+                spatial = prepare_spatial_maps(wfr)
+                patches, _positions = extract_patches(spatial)
+
+                # Compute ground-truth features
+                targets = compute_patch_features(patches)  # (N, F)
+                targets_t = torch.from_numpy(targets)
+
+                # Forward through CNN
+                patches_t = torch.from_numpy(patches)      # (N, C, P, P)
+                embeddings = self.agent.patch_cnn(patches_t)  # (N, D)
+                predictions = self.feature_head(embeddings)   # (N, F)
+
+                # MSE loss
+                loss = nn.functional.mse_loss(predictions, targets_t)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.params, max_norm=1.0)
+                self.optimizer.step()
+
+                n_patches = patches.shape[0]
+                epoch_loss += loss.item() * n_patches
+                epoch_patches += n_patches
+
+                with torch.no_grad():
+                    per_feat = (predictions - targets_t).pow(2).mean(dim=0).numpy()
+                    per_feature_mse += per_feat * n_patches
+
+            mean_loss = epoch_loss / max(epoch_patches, 1)
+            per_feature_mse /= max(epoch_patches, 1)
+
+            self.history.append({
+                'epoch': epoch,
+                'mean_loss': mean_loss,
+                'n_patches': epoch_patches,
+                'per_feature_mse': per_feature_mse.tolist(),
+            })
+
+            self.writer.add_scalar('pretrain/loss', mean_loss, epoch)
+            for fi, fname in enumerate(PATCH_FEATURE_NAMES):
+                self.writer.add_scalar(f'pretrain/mse_{fname}',
+                                       per_feature_mse[fi], epoch)
+
+            if verbose and (epoch + 1) % max(1, n_epochs // 20) == 0:
+                elapsed = time.time() - t0
+                worst_feat = PATCH_FEATURE_NAMES[np.argmax(per_feature_mse)]
+                print(f"  epoch {epoch+1:4d}/{n_epochs} | loss={mean_loss:.5f} | "
+                      f"patches={epoch_patches} | worst={worst_feat} "
+                      f"({per_feature_mse.max():.5f}) | {elapsed:.0f}s")
+
+        self.writer.flush()
+
+        if verbose:
+            print(f"\nCNN pretraining complete in {time.time()-t0:.1f}s")
+            print(f"  Final loss: {self.history[-1]['mean_loss']:.5f}")
+            print("  Per-feature MSE:")
+            final_mse = self.history[-1]['per_feature_mse']
+            for fi, fname in enumerate(PATCH_FEATURE_NAMES):
+                print(f"    {fname:25s}: {final_mse[fi]:.5f}")
+
+
+# ============================================================================
 # Agent (PyTorch nn.Module)
 # ============================================================================
 
