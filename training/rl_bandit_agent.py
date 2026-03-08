@@ -13,11 +13,12 @@ Architecture:
   - Value baseline for variance reduction
   - REINFORCE with entropy bonus
 
-Reward: stability-based (no reference wavefront needed).  The predicted
-parameters are validated via the PropagationValidator and then tested for
-stability by doubling all resize factors and checking that the result is
-highly correlated with the original.  Stable, validator-passing parameters
-receive a high reward.
+Reward: stability-based (no reference wavefront needed).  Quality and
+sufficiency are treated as separate signals: validator quality is an
+independent term, while stability margin (headroom above a threshold)
+provides gradient across valid modes.  Cost is ratio-based (excess over
+analytical baseline).  A supervised mode loss (imitation on the oracle)
+supplements REINFORCE for faster convergence.
 """
 
 import sys
@@ -58,6 +59,8 @@ N_AUX = 12       # analytical prior scalars
 N_MODES = 5      # AnalTreatment {0, 1, 2, 3, 4}
 N_RESIZE = 4     # (pxm, pxd, pzm, pzd)
 EMBED_DIM = 256  # embedding dimension (256 with PyTorch autograd)
+
+MAX_SIZE = 8192  # maximum grid size in SRW (for stability penalty)
 
 
 def _get_device(device: Optional[torch.device] = None) -> torch.device:
@@ -661,7 +664,7 @@ def apply_resize(wfr, pxm, pzm, pxd, pzd):
         d = dx if axis == 'x' else dz
 
         new_n = max(int(np.round(n * pm)), 8)
-        new_n = min(new_n, 32768)
+        new_n = min(new_n, MAX_SIZE)
         if new_n % 2 != 0:
             new_n += 1
 
@@ -732,7 +735,7 @@ def srw_propagate(wfr: WavefrontSnapshot, drift_length: float,
 
     o_nx = int(np.round(wfr.nx * params['pxm'] * params['pxd']))
     o_nz = int(np.round(wfr.nz * params['pzm'] * params['pzd']))
-    if o_nx > 32768 or o_nz > 32768:
+    if o_nx > MAX_SIZE or o_nz > MAX_SIZE:
         print (f"Warning: requested grid size ({o_nx} x {o_nz}) exceeds SRW limits, failing this propagation.")
         raise ValueError("Requested grid size exceeds SRW limits.")
 
@@ -831,8 +834,23 @@ def _interpolate_field(E, wfr, x_target, z_target):
     return E_out.reshape(len(z_target), len(x_target))
 
 
-def compute_cost(params):
-    """Computational cost relative to base grid."""
+def compute_cost(params, analytical_params=None):
+    """Computational cost — excess over analytical baseline if available.
+
+    When *analytical_params* is provided the cost measures how much larger the
+    chosen resize factors are compared to the minimum-necessary estimates from
+    the analytical prior.  This avoids penalising modes that legitimately need
+    larger grids (e.g. AT=0 on a high-curvature beam) — only *waste* is
+    penalised.
+
+    Falls back to the original ``log(product)`` cost when no baseline is given.
+    """
+    if analytical_params is not None:
+        excess_pxm = max(params['pxm'] / max(analytical_params['pxm'], 0.1) - 1.0, 0.0)
+        excess_pxd = max(params['pxd'] / max(analytical_params['pxd'], 0.1) - 1.0, 0.0)
+        excess_pzm = max(params['pzm'] / max(analytical_params['pzm'], 0.1) - 1.0, 0.0)
+        excess_pzd = max(params['pzd'] / max(analytical_params['pzd'], 0.1) - 1.0, 0.0)
+        return float(excess_pxm + excess_pxd + excess_pzm + excess_pzd)
     factor = params['pxm'] * params['pxd'] * params['pzm'] * params['pzd']
     return float(np.log(max(factor, 0.1)))
 
@@ -867,33 +885,31 @@ def compute_stability_reward(
     result_doubled,
     params,
     lambda_cost=0.1,
+    analytical_params=None,
+    doubled_params=None,
+    stability_threshold=0.95,
+    alpha_margin=1.0,
 ):
     """
     Stability-based reward that requires no reference wavefront.
 
-    The reward has three components:
+    The reward separates quality from sufficiency so that the policy sees a
+    real gradient across valid modes:
 
-    1. **Validator quality** (0–1): the ``PropagationValidator`` checks
-       energy conservation, edge clipping, sampling adequacy, intensity
-       discontinuities, Parseval consistency, and Nyquist artifacts on the
-       propagated result.  The ``overall_quality`` score from the report is
-       used directly.
-
-    2. **Stability correlation** (0–1): the complex-field correlation
-       between the result obtained with the original parameters and the
-       result obtained with doubled resize parameters.  If the parameters
-       are sufficient, doubling them should not change the physics — so the
-       correlation should be very close to 1.
-
-    3. **Cost penalty**: ``log(pxm·pxd·pzm·pzd)`` discourages
-       unnecessarily large grids.
+    1. **Validator quality** (0–1): independent quality signal from the
+       ``PropagationValidator``.
+    2. **Stability margin**: ``stability - threshold`` measures headroom
+       above the sufficiency bar.  Modes that barely pass get a tiny margin;
+       modes with comfortable headroom get more.
+    3. **Quality headroom** (optional): if *doubled_params* is provided the
+       validator is also run on the doubled result and the quality
+       improvement is rewarded as a small bonus.
+    4. **Cost penalty**: ratio-based excess over the analytical baseline when
+       available, otherwise ``log(product)``.
 
     Final reward::
 
-        reward = validator_quality * stability_correlation - λ_cost * cost
-
-    The multiplicative combination means *both* the validator and the
-    stability check must be satisfied for a high reward.
+        reward = quality + α * margin - λ * cost - grid_penalty + headroom_bonus
 
     Parameters
     ----------
@@ -907,36 +923,63 @@ def compute_stability_reward(
         The original propagation parameters (for cost computation).
     lambda_cost : float
         Weight of the computational-cost penalty (default 0.1).
+    analytical_params : dict, optional
+        Baseline parameters from the analytical prior.  When provided the
+        cost term is ratio-based (excess only).
+    doubled_params : dict, optional
+        The actual doubled parameter dict.  When provided the validator is
+        run on *result_doubled* too and a headroom bonus is computed.
+    stability_threshold : float
+        Threshold for the stability margin term (default 0.95).
+    alpha_margin : float
+        Weight of the stability margin term (default 1.0).
 
     Returns
     -------
     reward : float
     info : dict
         Breakdown with keys ``validator_quality``, ``validator_passed``,
-        ``stability``, ``cost``, ``reward``.
+        ``stability``, ``cost``, ``grid_penalty``, ``margin``,
+        ``headroom_bonus``, ``reward``.
     """
-    # --- 1. Validator quality ---
+    # --- 1. Validator quality (independent signal) ---
     report = _validator.validate(wfr_before, result, params)
     validator_quality = report.overall_quality
 
-    # --- 2. Stability correlation ---
+    # --- 2. Stability margin ---
     stability = compute_accuracy(result, result_doubled)
+    margin = stability - stability_threshold  # can be negative
 
-    # --- 3. Cost ---
-    cost = compute_cost(params)
+    # --- 3. Cost (ratio-based when analytical baseline available) ---
+    cost = compute_cost(params, analytical_params)
 
-    # --- 4. Grid-size penalty ---
-    # Heavily penalise parameters that would produce grids exceeding 32768
-    # per axis (the hard cap inside srw_propagate).
-    o_nx = int(np.round(wfr_before.nx * params['pxm'] * params['pxd']))
-    o_nz = int(np.round(wfr_before.nz * params['pzm'] * params['pzd']))
-    max_n = max(o_nx, o_nz)
-    if max_n > 32768:
-        grid_penalty = 2.0 * (max_n / 32768)  # scales with overshoot
+    # --- 4. Quality headroom from doubled params ---
+    headroom_bonus = 0.0
+    if doubled_params is not None:
+        try:
+            report_doubled = _validator.validate(
+                wfr_before, result_doubled, doubled_params)
+            quality_margin = report_doubled.overall_quality - validator_quality
+            headroom_bonus = max(quality_margin, 0.0) * 0.1
+        except Exception:
+            pass
+
+    # --- 5. Grid-size penalty (check doubled size) ---
+    # The stability test doubles all resize factors, so the doubled grid
+    # is what must fit within MAX_SIZE.
+    dbl_nx = int(np.round(wfr_before.nx * params['pxm'] * params['pxd'] * 2))
+    dbl_nz = int(np.round(wfr_before.nz * params['pzm'] * params['pzd'] * 2))
+    max_n = max(dbl_nx, dbl_nz)
+    if max_n > MAX_SIZE:
+        grid_penalty = 2.0 * (max_n / MAX_SIZE)
     else:
         grid_penalty = 0.0
 
-    reward = validator_quality * stability - lambda_cost * cost - grid_penalty
+    reward = (validator_quality
+              + alpha_margin * margin
+              - lambda_cost * cost
+              - grid_penalty
+              + headroom_bonus)
 
     info = {
         'validator_quality': validator_quality,
@@ -944,6 +987,8 @@ def compute_stability_reward(
         'stability': stability,
         'cost': cost,
         'grid_penalty': grid_penalty,
+        'margin': margin,
+        'headroom_bonus': headroom_bonus,
         'reward': reward,
     }
     return reward, info
@@ -1358,7 +1403,7 @@ class BanditTrainer:
             print(f"Agent: D={self.agent.D}, {self.agent.n_blocks} transformer blocks, "
                   f"{n_params:,} parameters")
             print(f"Device: {dev}")
-            print(f"Reward: stability-based (validator quality × doubled-param correlation)")
+            print(f"Reward: quality + α·margin - λ·cost + headroom (separated quality/sufficiency)")
 
         t0 = time.time()
 
@@ -1396,35 +1441,52 @@ class BanditTrainer:
                     self.agent.forward(spatial, prior)
                 mode_dist = Categorical(logits=mode_logits)
 
+                # Analytical baseline for ratio-based cost
+                ap = get_analytical_params(prior)
+
                 # Explore ALL modes for this wavefront
                 mode_rewards = []
+                mode_infos = []
                 for m in range(N_MODES):
                     rp = resize_params_all[m]
                     rd_m = rp['mean'].detach().cpu().numpy()
                     params_m = action_to_params(m, rd_m, prior)
 
-                    # Check grid size before expensive propagation
-                    o_nx = int(np.round(wfr.nx * params_m['pxm'] * params_m['pxd']))
-                    o_nz = int(np.round(wfr.nz * params_m['pzm'] * params_m['pzd']))
-                    if o_nx > 32768 or o_nz > 32768:
-                        pen = 2.0 * (max(o_nx, o_nz) / 32768)
+                    # Check against doubled grid size before expensive
+                    # propagation — the stability test doubles all resize
+                    # factors, so the *doubled* grid is what must fit.
+                    dbl_nx = int(np.round(wfr.nx * params_m['pxm'] * params_m['pxd'] * 2))
+                    dbl_nz = int(np.round(wfr.nz * params_m['pzm'] * params_m['pzd'] * 2))
+                    if dbl_nx > MAX_SIZE or dbl_nz > MAX_SIZE:
+                        pen = 2.0 * (max(dbl_nx, dbl_nz) / MAX_SIZE)
                         mode_rewards.append(-pen)
+                        mode_infos.append({'stability': 0.0,
+                                           'validator_quality': 0.0,
+                                           'cost': 0.0})
                         continue
 
                     try:
                         res_m = self.propagate_fn(wfr, L, params_m)
-                        res_m_dbl = self.propagate_fn(
-                            wfr, L, _double_resize_params(params_m))
-                        rw_m, _ = compute_stability_reward(
-                            wfr, res_m, res_m_dbl, params_m, self.lambda_cost)
+                        dbl_params_m = _double_resize_params(params_m)
+                        res_m_dbl = self.propagate_fn(wfr, L, dbl_params_m)
+                        rw_m, info_m = compute_stability_reward(
+                            wfr, res_m, res_m_dbl, params_m,
+                            self.lambda_cost,
+                            analytical_params=ap,
+                            doubled_params=dbl_params_m)
                         mode_rewards.append(rw_m)
+                        mode_infos.append(info_m)
                     except Exception:
                         mode_rewards.append(0.0)
+                        mode_infos.append({'stability': 0.0,
+                                           'validator_quality': 0.0,
+                                           'cost': 0.0})
 
-                # Best-mode reward used as value target
+                # Best-mode reward used as value target and supervised signal
                 best_reward = max(mode_rewards)
+                best_mode = int(np.argmax(mode_rewards))
 
-                # Sample from the policy for gradient (as before)
+                # Sample from the policy for gradient
                 mode_t = mode_dist.sample()
                 mode = mode_t.item()
                 rp = resize_params_all[mode]
@@ -1440,27 +1502,38 @@ class BanditTrainer:
                 reward = mode_rewards[mode]
 
                 reward_t = torch.tensor(reward, dtype=torch.float32, device=dev)
-                best_reward_t = torch.tensor(best_reward, dtype=torch.float32,
-                                             device=dev)
 
-                # REINFORCE loss with value baseline
+                # --- Fix 2: proper actor-critic ---
+                # Value targets the sampled reward (standard actor-critic)
                 advantage = reward_t - value.detach()
                 policy_loss = -(advantage * log_prob)
-                # Value head targets the best achievable reward across modes
-                value_loss = 0.5 * (value - best_reward_t).pow(2)
+                value_loss = 0.5 * (value - reward_t.detach()).pow(2)
                 entropy_loss = -self.entropy_coeff * entropy
 
-                info = {
+                # Supervised mode loss: push policy toward best mode
+                # (imitation learning on the oracle — converges faster
+                # than pure REINFORCE since we evaluate all modes)
+                best_mode_t = torch.tensor(best_mode, dtype=torch.long,
+                                           device=dev)
+                supervised_loss = nn.CrossEntropyLoss()(
+                    mode_logits.unsqueeze(0), best_mode_t.unsqueeze(0))
+                # Scale by how much better the best mode is
+                avg_mode_reward = float(np.mean(mode_rewards))
+                best_advantage = max(best_reward - avg_mode_reward, 0.0)
+                supervised_loss = supervised_loss * best_advantage
+
+                info = mode_infos[mode] if mode_infos[mode] else {
                     'stability': 0.0,
                     'validator_quality': 0.0,
                     'cost': compute_cost(
                         action_to_params(mode,
                                          resize_params_all[mode]['mean']
-                                         .detach().cpu().numpy(), prior)),
+                                         .detach().cpu().numpy(), prior), ap),
                     'reward': reward,
                 }
 
-                batch_loss = batch_loss + policy_loss + value_loss + entropy_loss
+                batch_loss = (batch_loss + policy_loss + value_loss
+                              + entropy_loss + supervised_loss)
                 n_valid += 1
 
                 batch_rewards.append(reward)
@@ -1678,23 +1751,27 @@ def predict_all_modes(agent: BanditAgent, wfr: WavefrontSnapshot,
             'reward': None,
             'stability': None,
             'validator_quality': None,
-            'cost': compute_cost(params),
+            'cost': compute_cost(params, ap),
             'grid_penalty': 0.0,
         }
 
-        # Skip propagation for grids that massively exceed the cap
-        if o_nx > 32768 or o_nz > 32768:
-            entry['reward'] = -2.0 * (max(o_nx, o_nz) / 32768)
+        # Check against doubled grid size — the stability test doubles
+        # all resize factors, so skip early if even the original × 2
+        # would exceed the cap.
+        dbl_nx, dbl_nz = o_nx * 2, o_nz * 2
+        if dbl_nx > MAX_SIZE or dbl_nz > MAX_SIZE:
+            entry['reward'] = -2.0 * (max(dbl_nx, dbl_nz) / MAX_SIZE)
             entry['grid_penalty'] = -entry['reward']
             entry['stability'] = 0.0
             entry['validator_quality'] = 0.0
         else:
             try:
                 res = _propagate(wfr, drift_length, params)
-                res_dbl = _propagate(wfr, drift_length,
-                                     _double_resize_params(params))
+                dbl_params = _double_resize_params(params)
+                res_dbl = _propagate(wfr, drift_length, dbl_params)
                 reward, info = compute_stability_reward(
-                    wfr, res, res_dbl, params, lambda_cost)
+                    wfr, res, res_dbl, params, lambda_cost,
+                    analytical_params=ap, doubled_params=dbl_params)
                 entry['reward'] = reward
                 entry['stability'] = info['stability']
                 entry['validator_quality'] = info['validator_quality']
@@ -1744,6 +1821,10 @@ def evaluate(agent, n_test=30, verbose=True, writer=None, global_step=None,
         wfr, L = generate_universal_wavefront(rng, nx=rng.choice([128, 256]),
                                                 nz=rng.choice([128, 256]))
 
+        # --- Analytical baseline ---
+        prior = prepare_analytical_prior(wfr, L)
+        ap = get_analytical_params(prior)
+
         # --- Agent prediction ---
         pred = predict(agent, wfr, L)
         pred_params = {'analyt_treat': pred.analyt_treat,
@@ -1751,29 +1832,31 @@ def evaluate(agent, n_test=30, verbose=True, writer=None, global_step=None,
                        'pzm': pred.pzm, 'pzd': pred.pzd}
         try:
             res_a = _propagate(wfr, L, pred_params)
-            res_a_dbl = _propagate(wfr, L, _double_resize_params(pred_params))
+            dbl_pred = _double_resize_params(pred_params)
+            res_a_dbl = _propagate(wfr, L, dbl_pred)
             reward_a, info_a = compute_stability_reward(
-                wfr, res_a, res_a_dbl, pred_params)
+                wfr, res_a, res_a_dbl, pred_params,
+                analytical_params=ap, doubled_params=dbl_pred)
         except Exception:
             reward_a = 0.0
             info_a = {'stability': 0.0, 'validator_quality': 0.0,
-                      'cost': compute_cost(pred_params)}
+                      'cost': compute_cost(pred_params, ap)}
 
         # --- Baseline: analytical params, no correction ---
-        prior = prepare_analytical_prior(wfr, L)
-        ap = get_analytical_params(prior)
         base_params = {'analyt_treat': ap['AT'],
                        'pxm': ap['pxm'], 'pxd': ap['pxd'],
                        'pzm': ap['pzm'], 'pzd': ap['pzd']}
         try:
             res_b = _propagate(wfr, L, base_params)
-            res_b_dbl = _propagate(wfr, L, _double_resize_params(base_params))
+            dbl_base = _double_resize_params(base_params)
+            res_b_dbl = _propagate(wfr, L, dbl_base)
             reward_b, info_b = compute_stability_reward(
-                wfr, res_b, res_b_dbl, base_params)
+                wfr, res_b, res_b_dbl, base_params,
+                analytical_params=ap, doubled_params=dbl_base)
         except Exception:
             reward_b = 0.0
             info_b = {'stability': 0.0, 'validator_quality': 0.0,
-                      'cost': compute_cost(base_params)}
+                      'cost': compute_cost(base_params, ap)}
 
         agent_rewards.append(reward_a)
         baseline_rewards.append(reward_b)
