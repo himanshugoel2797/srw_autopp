@@ -661,6 +661,7 @@ def apply_resize(wfr, pxm, pzm, pxd, pzd):
         d = dx if axis == 'x' else dz
 
         new_n = max(int(np.round(n * pm)), 8)
+        new_n = min(new_n, 32768)
         if new_n % 2 != 0:
             new_n += 1
 
@@ -728,6 +729,12 @@ def srw_propagate(wfr: WavefrontSnapshot, drift_length: float,
     from srwpy.srwlib import srwl, SRWLOptD, SRWLOptC
 
     srw_wfr = wfr.to_srw()
+
+    o_nx = int(np.round(wfr.nx * params['pxm'] * params['pxd']))
+    o_nz = int(np.round(wfr.nz * params['pzm'] * params['pzd']))
+    if o_nx > 32768 or o_nz > 32768:
+        print (f"Warning: requested grid size ({o_nx} x {o_nz}) exceeds SRW limits, failing this propagation.")
+        raise ValueError("Requested grid size exceeds SRW limits.")
 
     # SRW propagation parameter list (12 elements):
     #  [0]: Auto-Resize before (1=yes, 0=no)
@@ -918,13 +925,25 @@ def compute_stability_reward(
     # --- 3. Cost ---
     cost = compute_cost(params)
 
-    reward = validator_quality * stability - lambda_cost * cost
+    # --- 4. Grid-size penalty ---
+    # Heavily penalise parameters that would produce grids exceeding 32768
+    # per axis (the hard cap inside srw_propagate).
+    o_nx = int(np.round(wfr_before.nx * params['pxm'] * params['pxd']))
+    o_nz = int(np.round(wfr_before.nz * params['pzm'] * params['pzd']))
+    max_n = max(o_nx, o_nz)
+    if max_n > 32768:
+        grid_penalty = 2.0 * (max_n / 32768)  # scales with overshoot
+    else:
+        grid_penalty = 0.0
+
+    reward = validator_quality * stability - lambda_cost * cost - grid_penalty
 
     info = {
         'validator_quality': validator_quality,
         'validator_passed': report.passed,
         'stability': stability,
         'cost': cost,
+        'grid_penalty': grid_penalty,
         'reward': reward,
     }
     return reward, info
@@ -1372,37 +1391,74 @@ class BanditTrainer:
                 spatial = prepare_spatial_maps(wfr)
                 prior = prepare_analytical_prior(wfr, L)
 
-                # Forward + sample (agent is already on device)
-                mode, resize_deltas, log_prob, entropy, value, mode_probs = \
-                    self.agent.sample_action(spatial, prior)
+                # Forward pass once to get all mode distributions
+                mode_logits, resize_params_all, value = \
+                    self.agent.forward(spatial, prior)
+                mode_dist = Categorical(logits=mode_logits)
 
-                params = action_to_params(mode, resize_deltas, prior)
-                doubled_params = _double_resize_params(params)
+                # Explore ALL modes for this wavefront
+                mode_rewards = []
+                for m in range(N_MODES):
+                    rp = resize_params_all[m]
+                    rd_m = rp['mean'].detach().cpu().numpy()
+                    params_m = action_to_params(m, rd_m, prior)
 
-                # Propagate with original and doubled parameters
-                try:
-                    result = self.propagate_fn(wfr, L, params)
-                    result_doubled = self.propagate_fn(wfr, L, doubled_params)
-                    reward, info = compute_stability_reward(
-                        wfr, result, result_doubled, params, self.lambda_cost,
-                    )
-                except Exception:
-                    reward = 0.0
-                    info = {
-                        'validator_quality': 0.0,
-                        'validator_passed': False,
-                        'stability': 0.0,
-                        'cost': compute_cost(params),
-                        'reward': 0.0,
-                    }
+                    # Check grid size before expensive propagation
+                    o_nx = int(np.round(wfr.nx * params_m['pxm'] * params_m['pxd']))
+                    o_nz = int(np.round(wfr.nz * params_m['pzm'] * params_m['pzd']))
+                    if o_nx > 32768 or o_nz > 32768:
+                        pen = 2.0 * (max(o_nx, o_nz) / 32768)
+                        mode_rewards.append(-pen)
+                        continue
+
+                    try:
+                        res_m = self.propagate_fn(wfr, L, params_m)
+                        res_m_dbl = self.propagate_fn(
+                            wfr, L, _double_resize_params(params_m))
+                        rw_m, _ = compute_stability_reward(
+                            wfr, res_m, res_m_dbl, params_m, self.lambda_cost)
+                        mode_rewards.append(rw_m)
+                    except Exception:
+                        mode_rewards.append(0.0)
+
+                # Best-mode reward used as value target
+                best_reward = max(mode_rewards)
+
+                # Sample from the policy for gradient (as before)
+                mode_t = mode_dist.sample()
+                mode = mode_t.item()
+                rp = resize_params_all[mode]
+                stds = rp['log_std'].exp()
+                resize_dist = Normal(rp['mean'], stds)
+                resize_deltas_t = resize_dist.rsample()
+
+                log_prob = (mode_dist.log_prob(mode_t)
+                            + resize_dist.log_prob(resize_deltas_t).sum())
+                entropy = mode_dist.entropy() + resize_dist.entropy().sum()
+
+                # Use the sampled mode's actual reward for REINFORCE
+                reward = mode_rewards[mode]
 
                 reward_t = torch.tensor(reward, dtype=torch.float32, device=dev)
+                best_reward_t = torch.tensor(best_reward, dtype=torch.float32,
+                                             device=dev)
 
                 # REINFORCE loss with value baseline
                 advantage = reward_t - value.detach()
                 policy_loss = -(advantage * log_prob)
-                value_loss = 0.5 * (value - reward_t).pow(2)
+                # Value head targets the best achievable reward across modes
+                value_loss = 0.5 * (value - best_reward_t).pow(2)
                 entropy_loss = -self.entropy_coeff * entropy
+
+                info = {
+                    'stability': 0.0,
+                    'validator_quality': 0.0,
+                    'cost': compute_cost(
+                        action_to_params(mode,
+                                         resize_params_all[mode]['mean']
+                                         .detach().cpu().numpy(), prior)),
+                    'reward': reward,
+                }
 
                 batch_loss = batch_loss + policy_loss + value_loss + entropy_loss
                 n_valid += 1
@@ -1540,6 +1596,136 @@ def predict(agent: BanditAgent, wfr: WavefrontSnapshot, drift_length: float,
             'd_pzd': float(resize_deltas[3]),
         },
     )
+
+
+def predict_all_modes(agent: BanditAgent, wfr: WavefrontSnapshot,
+                      drift_length: float, R_x=None, R_z=None,
+                      propagate_fn=None, lambda_cost=0.1,
+                      verbose=False) -> list:
+    """
+    Explore all modes and return a ranked list of PredictionResults.
+
+    For each mode the agent's learned resize distribution is used (mean),
+    the candidate is propagated and scored with the stability reward so
+    that the caller can compare numerically-correct but differently-
+    efficient solutions side by side.
+
+    Parameters
+    ----------
+    agent : BanditAgent
+    wfr : WavefrontSnapshot
+    drift_length : float
+    R_x, R_z : float, optional
+        Radius-of-curvature overrides.
+    propagate_fn : callable, optional
+        Propagation function (defaults to ``srw_propagate``).
+    lambda_cost : float
+        Cost weight passed to ``compute_stability_reward``.
+    verbose : bool
+
+    Returns
+    -------
+    list of dict
+        One entry per mode, sorted best-first by reward.  Each dict
+        contains ``'prediction'`` (PredictionResult), ``'reward'``,
+        ``'stability'``, ``'validator_quality'``, ``'cost'``,
+        ``'grid_penalty'``, and ``'output_grid'`` (nx, nz tuple).
+    """
+    _propagate = propagate_fn or srw_propagate
+    agent.eval()
+    spatial = prepare_spatial_maps(wfr)
+    prior = prepare_analytical_prior(wfr, drift_length, R_x=R_x, R_z=R_z)
+    ap = get_analytical_params(prior)
+
+    # Run a single forward pass to get per-mode resize distributions
+    mode_logits, resize_params, value = agent.forward(spatial, prior)
+    mode_probs = torch.softmax(mode_logits, dim=0).detach().cpu().numpy()
+
+    results = []
+    for mode in range(N_MODES):
+        resize_deltas = resize_params[mode]['mean'].detach().cpu().numpy()
+        params = action_to_params(mode, resize_deltas, prior)
+
+        # Predicted output grid size
+        o_nx = int(np.round(wfr.nx * params['pxm'] * params['pxd']))
+        o_nz = int(np.round(wfr.nz * params['pzm'] * params['pzd']))
+
+        pred = PredictionResult(
+            analyt_treat=mode,
+            mode_name=MODE_NAMES[mode],
+            pxm=round(params['pxm'], 3),
+            pxd=round(params['pxd'], 3),
+            pzm=round(params['pzm'], 3),
+            pzd=round(params['pzd'], 3),
+            confidence=float(mode_probs[mode]),
+            expected_reward=float(value.item()),
+            mode_probabilities={MODE_NAMES[i]: float(p)
+                                for i, p in enumerate(mode_probs)},
+            analytical_suggestion=ap,
+            corrections={
+                'd_pxm': float(resize_deltas[0]),
+                'd_pxd': float(resize_deltas[1]),
+                'd_pzm': float(resize_deltas[2]),
+                'd_pzd': float(resize_deltas[3]),
+            },
+        )
+
+        entry = {
+            'prediction': pred,
+            'mode': mode,
+            'mode_name': MODE_NAMES[mode],
+            'output_grid': (o_nx, o_nz),
+            'reward': None,
+            'stability': None,
+            'validator_quality': None,
+            'cost': compute_cost(params),
+            'grid_penalty': 0.0,
+        }
+
+        # Skip propagation for grids that massively exceed the cap
+        if o_nx > 32768 or o_nz > 32768:
+            entry['reward'] = -2.0 * (max(o_nx, o_nz) / 32768)
+            entry['grid_penalty'] = -entry['reward']
+            entry['stability'] = 0.0
+            entry['validator_quality'] = 0.0
+        else:
+            try:
+                res = _propagate(wfr, drift_length, params)
+                res_dbl = _propagate(wfr, drift_length,
+                                     _double_resize_params(params))
+                reward, info = compute_stability_reward(
+                    wfr, res, res_dbl, params, lambda_cost)
+                entry['reward'] = reward
+                entry['stability'] = info['stability']
+                entry['validator_quality'] = info['validator_quality']
+                entry['grid_penalty'] = info.get('grid_penalty', 0.0)
+            except Exception as exc:
+                entry['reward'] = 0.0
+                entry['stability'] = 0.0
+                entry['validator_quality'] = 0.0
+                if verbose:
+                    print(f"  Mode {mode} ({MODE_NAMES[mode]}): "
+                          f"propagation failed — {exc}")
+
+        results.append(entry)
+
+    # Sort best-first by reward
+    results.sort(key=lambda r: -(r['reward'] if r['reward'] is not None else -999))
+
+    if verbose:
+        print(f"All-mode exploration ({len(results)} modes):")
+        print(f"  {'Mode':30s} {'Grid':>12s} {'Stab':>6s} "
+              f"{'Qual':>6s} {'Cost':>7s} {'Pen':>6s} {'Reward':>8s}")
+        for r in results:
+            nx, nz = r['output_grid']
+            print(f"  {r['mode_name']:30s} {nx:5d}x{nz:<5d} "
+                  f"{r['stability'] or 0:6.3f} "
+                  f"{r['validator_quality'] or 0:6.3f} "
+                  f"{r['cost']:7.2f} "
+                  f"{r['grid_penalty']:6.2f} "
+                  f"{r['reward'] or 0:+8.3f}")
+
+    return results
 
 
 def evaluate(agent, n_test=30, verbose=True, writer=None, global_step=None,
